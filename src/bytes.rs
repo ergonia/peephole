@@ -85,7 +85,7 @@ pub unsafe fn slurp_const<T: Pod>(input: *const u8) -> (&'static T, *const u8) {
 }
 
 /// A trait for types that can be converted to and from byte slices.
-pub unsafe trait PodVec: Sized {
+pub unsafe trait PodUtils: Sized {
     /// Converts the implementing type to a slice of bytes.
     fn to_bytes(&self) -> &[u8];
 
@@ -98,9 +98,28 @@ pub unsafe trait PodVec: Sized {
     ///
     /// Returns `None` if the slice doesn't have the correct length.
     fn try_from_slice(slice: &[u8]) -> Option<Self>;
+
+    #[inline]
+    fn from_slice(slice: &[u8]) -> Self {
+        Self::try_from_slice(slice).unwrap()
+    }
+
+    #[inline]
+    fn try_write_to_slice(&self, into: &mut [u8]) -> bool {
+        if into.len() != self.to_bytes().len() {
+            return false;
+        }
+        into.copy_from_slice(self.to_bytes());
+        true
+    }
+
+    #[inline]
+    fn write_to_slice(&self, into: &mut [u8]) {
+        assert!(self.try_write_to_slice(into))
+    }
 }
 
-unsafe impl<T: Pod> PodVec for T {
+unsafe impl<T: Pod> PodUtils for T {
     #[inline]
     fn to_bytes(&self) -> &[u8] {
         bytemuck::bytes_of(self)

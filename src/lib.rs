@@ -30,6 +30,6 @@
 //! and functions.
 
 pub mod account_iterator;
-pub mod utils;
 pub mod assume;
 pub mod bytes;
+pub mod utils;

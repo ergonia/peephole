@@ -128,7 +128,7 @@ impl<'a> NonDupAccount<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::bytes::PodVec;
+    use crate::bytes::PodUtils;
 
     use super::*;
     use quickcheck::Arbitrary;
