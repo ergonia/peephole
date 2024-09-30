@@ -55,6 +55,17 @@ pub fn fast_cmp_pubkey(a: &Pubkey, b: &Pubkey) -> bool {
 mod tests {
     use super::*;
 
+    #[quickcheck_macros::quickcheck]
+    fn quickcheck_fast_cmp_pubkey_equal(a: (u64, u64, u64, u64), b: (u64, u64, u64, u64)) {
+        let a = unsafe { std::mem::transmute(a) };
+        let b = unsafe { std::mem::transmute(b) };
+        let pubkey_a = Pubkey::new_from_array(a);
+        let pubkey_b = Pubkey::new_from_array(b);
+
+        assert_eq!(a == b, pubkey_a == pubkey_b);
+        assert_eq!(fast_cmp_pubkey(&pubkey_a, &pubkey_b), pubkey_a == pubkey_b);
+    }
+
     #[test]
     fn test_fast_cmp_pubkey_equal() {
         let pubkey1 = Pubkey::new_unique();
