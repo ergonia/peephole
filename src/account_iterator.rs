@@ -38,35 +38,13 @@ impl AccountIterator {
     #[inline(always)]
     pub fn next(self) -> NextAccount {
         if self.remaining_accounts == 0 {
-            let (instruction_length, instruction_data) = unsafe { slurp::<u64>(self.base_ptr) };
-            let slice = unsafe {
-                std::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize)
-            };
+            let slice = self.slurp_instruction_data();
             return NextAccount::Data(slice);
         } else {
             let is_dup = unsafe { *self.base_ptr };
             let (acc, next) = if is_dup == NON_DUP_MARKER {
-                let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
-                unsafe {
-                    let data =
-                        std::slice::from_raw_parts_mut(next, account_static.data_len as usize);
-
-                    let next =
-                        next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
-
-                    // We could trim these CUs if we enforced that every account is aligned?
-                    let next = next.add(next.align_offset(BPF_ALIGN_OF_U128));
-
-                    let (rent_epoch, next) = slurp::<u64>(next);
-
-                    let account = NonDupAccount {
-                        static_data: account_static,
-                        all_data: data,
-                        rent_epoch,
-                    };
-
-                    (AccountInInstruction::RealAccount(account), next)
-                }
+                let (non_dup, next) = self.slurp_real_account();
+                (AccountInInstruction::RealAccount(non_dup), next)
             } else {
                 let next = unsafe { self.base_ptr.add(8) };
                 (AccountInInstruction::Dup(is_dup as usize), next)
@@ -75,6 +53,55 @@ impl AccountIterator {
                 AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
             });
         }
+    }
+
+    #[inline]
+    pub unsafe fn known_next_full_account(self) -> (NonDupAccount<'static>, AccountIterator) {
+        debug_assert!(self.remaining_accounts > 0);
+
+        let is_dup = unsafe { &*self.base_ptr };
+
+        debug_assert_eq!(*is_dup, NON_DUP_MARKER);
+
+        let (account, next) = self.slurp_real_account();
+
+        (account, unsafe {
+            AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
+        })
+    }
+
+    #[inline]
+    pub unsafe fn known_instruction_data(self) -> &'static mut [u8] {
+        self.slurp_instruction_data()
+    }
+
+    #[inline]
+    fn slurp_real_account(&self) -> (NonDupAccount<'static>, *mut u8) {
+        let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
+        unsafe {
+            let data = std::slice::from_raw_parts_mut(next, account_static.data_len as usize);
+
+            let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+
+            // We could trim these CUs if we enforced that every account is aligned?
+            let next = next.add(next.align_offset(BPF_ALIGN_OF_U128));
+
+            let (rent_epoch, next) = slurp::<u64>(next);
+
+            let account = NonDupAccount {
+                static_data: account_static,
+                all_data: data,
+                rent_epoch,
+            };
+
+            (account, next)
+        }
+    }
+
+    #[inline]
+    fn slurp_instruction_data(self) -> &'static mut [u8] {
+        let (instruction_length, instruction_data) = unsafe { slurp::<u64>(self.base_ptr) };
+        unsafe { std::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize) }
     }
 
     #[inline]
