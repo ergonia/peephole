@@ -56,6 +56,7 @@ mod tests {
     use super::*;
 
     #[quickcheck_macros::quickcheck]
+    #[allow(clippy::missing_transmute_annotations)]
     fn quickcheck_fast_cmp_pubkey_equal(a: (u64, u64, u64, u64), b: (u64, u64, u64, u64)) {
         let a = unsafe { std::mem::transmute(a) };
         let b = unsafe { std::mem::transmute(b) };

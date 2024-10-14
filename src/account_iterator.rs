@@ -21,12 +21,40 @@ pub struct AccountIterator {
 }
 
 impl AccountIterator {
+    /// Creates a new AccountIterator from the instruction data.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointer is valid and the account count is correct.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - A pointer to the start of the instruction data.
+    ///
+    /// # Returns
+    ///
+    /// A new AccountIterator instance.
     #[inline]
-    pub fn new_from_instruction(base: *mut u8) -> Self {
+    pub unsafe fn new_from_instruction(base: *mut u8) -> Self {
         let (num_accounts, next_ptr) = unsafe { slurp::<u64>(base) };
-        unsafe { Self::new_from_raw(next_ptr, *num_accounts as usize) }
+        Self::new_from_raw(next_ptr, *num_accounts as usize)
     }
 
+    /// Creates a new AccountIterator from raw pointer and account count.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it works with raw pointers.
+    /// The caller must ensure that the pointer is valid and the account count is correct.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_ptr` - A pointer to the start of the account data.
+    /// * `remaining_accounts` - The number of remaining accounts to iterate over.
+    ///
+    /// # Returns
+    ///
+    /// A new AccountIterator instance.
     #[inline]
     pub unsafe fn new_from_raw(base_ptr: *mut u8, remaining_accounts: usize) -> Self {
         Self {
@@ -35,11 +63,16 @@ impl AccountIterator {
         }
     }
 
+    /// Advances the iterator and returns the next account or instruction data.
+    ///
+    /// # Returns
+    ///
+    /// A NextAccount enum containing either the next account or the instruction data.
     #[inline(always)]
     pub fn next(self) -> NextAccount {
         if self.remaining_accounts == 0 {
             let slice = self.slurp_instruction_data();
-            return NextAccount::Data(slice);
+            NextAccount::Data(slice)
         } else {
             let is_dup = unsafe { *self.base_ptr };
             let (acc, next) = if is_dup == NON_DUP_MARKER {
@@ -49,12 +82,22 @@ impl AccountIterator {
                 let next = unsafe { self.base_ptr.add(8) };
                 (AccountInInstruction::Dup(is_dup as usize), next)
             };
-            return NextAccount::Account(acc, unsafe {
+            NextAccount::Account(acc, unsafe {
                 AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
-            });
+            })
         }
     }
 
+    /// Retrieves the next full (non-duplicate) account.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it assumes the next account is a full account.
+    /// The caller must ensure that this assumption holds true.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the next full account and the updated iterator.
     #[inline]
     pub unsafe fn known_next_full_account(self) -> (NonDupAccount<'static>, AccountIterator) {
         debug_assert!(self.remaining_accounts > 0);
@@ -70,11 +113,26 @@ impl AccountIterator {
         })
     }
 
+    /// Retrieves the instruction data.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it assumes the iterator is at the instruction data.
+    /// The caller must ensure that all accounts have been processed before calling this.
+    ///
+    /// # Returns
+    ///
+    /// A slice containing the instruction data.
     #[inline]
     pub unsafe fn known_instruction_data(self) -> &'static mut [u8] {
         self.slurp_instruction_data()
     }
 
+    /// Helper function to retrieve a real (non-duplicate) account.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the NonDupAccount and a pointer to the next data.
     #[inline]
     fn slurp_real_account(&self) -> (NonDupAccount<'static>, *mut u8) {
         let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
@@ -98,17 +156,32 @@ impl AccountIterator {
         }
     }
 
+    /// Helper function to retrieve the instruction data.
+    ///
+    /// # Returns
+    ///
+    /// A slice containing the instruction data.
     #[inline]
     fn slurp_instruction_data(self) -> &'static mut [u8] {
         let (instruction_length, instruction_data) = unsafe { slurp::<u64>(self.base_ptr) };
         unsafe { std::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize) }
     }
 
+    /// Returns the number of remaining accounts to be processed.
+    ///
+    /// # Returns
+    ///
+    /// The count of remaining accounts.
     #[inline]
     pub fn remaining_accounts(&self) -> usize {
         self.remaining_accounts
     }
 
+    /// Returns the current base pointer of the iterator.
+    ///
+    /// # Returns
+    ///
+    /// A pointer to the current position in the data.
     #[inline]
     pub fn base_ptr(&self) -> *mut u8 {
         self.base_ptr
@@ -223,7 +296,7 @@ mod tests {
         for account in accounts {
             match account {
                 TestAccount::Real(acc, data) => {
-                    instruction.extend_from_slice(&acc.to_bytes());
+                    instruction.extend_from_slice(acc.to_bytes());
                     instruction.extend_from_slice(&data);
                     instruction.extend_from_slice(&vec![0; MAX_PERMITTED_DATA_INCREASE]);
                     let current_length = instruction.len();
@@ -251,7 +324,8 @@ mod tests {
 
     fn test_account_parsing(accounts: Vec<TestAccount>, instruction_data: Vec<u8>) {
         let mut instruction = create_test_instruction(accounts.clone(), instruction_data.clone());
-        let mut iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         for expected_account in accounts {
             match iterator.next() {
@@ -303,22 +377,19 @@ mod tests {
 
         let test_cases = vec![
             (vec![], vec![1, 2, 3, 4]),
-            (
-                vec![TestAccount::Real(account1.clone(), data1.clone())],
-                vec![5, 6],
-            ),
+            (vec![TestAccount::Real(account1, data1.clone())], vec![5, 6]),
             (
                 vec![
-                    TestAccount::Real(account1.clone(), data1.clone()),
-                    TestAccount::Real(account2.clone(), data2.clone()),
+                    TestAccount::Real(account1, data1.clone()),
+                    TestAccount::Real(account2, data2.clone()),
                 ],
                 vec![7, 8, 9],
             ),
             (
                 vec![
-                    TestAccount::Real(account1.clone(), data1.clone()),
+                    TestAccount::Real(account1, data1.clone()),
                     TestAccount::Duplicate(0),
-                    TestAccount::Real(account2.clone(), data2.clone()),
+                    TestAccount::Real(account2, data2.clone()),
                 ],
                 vec![10],
             ),
@@ -343,7 +414,7 @@ mod tests {
         let instruction_data = vec![1, 2, 3, 4];
         let mut instruction = create_test_instruction(vec![], instruction_data.clone());
 
-        let iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         match iterator.next() {
             NextAccount::Data(data) => assert_eq!(data, instruction_data.as_slice()),
@@ -360,7 +431,7 @@ mod tests {
             instruction_data.clone(),
         );
 
-        let iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         match iterator.next() {
             NextAccount::Account(AccountInInstruction::RealAccount(acc), next_iter) => {
@@ -390,7 +461,8 @@ mod tests {
             instruction_data.clone(),
         );
 
-        let mut iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         for _ in 0..2 {
             match iterator.next() {
@@ -415,7 +487,8 @@ mod tests {
             vec![],
         );
 
-        let mut iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         match iterator.next() {
             NextAccount::Account(AccountInInstruction::Dup(index), next_iter) => {
@@ -444,17 +517,13 @@ mod tests {
             .collect();
         let mut instruction = create_test_instruction(accounts, vec![]);
 
-        let mut iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let mut count = 0;
 
-        loop {
-            match iterator.next() {
-                NextAccount::Account(_, next_iter) => {
-                    count += 1;
-                    iterator = next_iter;
-                }
-                NextAccount::Data(_) => break,
-            }
+        while let NextAccount::Account(_, next_iter) = iterator.next() {
+            count += 1;
+            iterator = next_iter;
         }
 
         assert_eq!(count, num_accounts);
@@ -465,7 +534,7 @@ mod tests {
         let instruction_data = vec![1, 2, 3, 4, 5];
         let mut instruction = create_test_instruction(vec![], instruction_data.clone());
 
-        let iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         match iterator.next() {
             NextAccount::Data(data) => assert_eq!(data.len(), instruction_data.len()),
@@ -485,7 +554,8 @@ mod tests {
             vec![],
         );
 
-        let mut iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         if let NextAccount::Account(AccountInInstruction::RealAccount(acc1), next_iter) =
             iterator.next()
@@ -517,7 +587,8 @@ mod tests {
             vec![],
         );
 
-        let mut iterator = AccountIterator::new_from_instruction(instruction.as_mut_ptr());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         if let NextAccount::Account(AccountInInstruction::RealAccount(acc1), next_iter) =
             iterator.next()

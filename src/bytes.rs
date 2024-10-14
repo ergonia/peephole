@@ -85,7 +85,7 @@ pub unsafe fn slurp_const<T: Pod>(input: *const u8) -> (&'static T, *const u8) {
 }
 
 /// A trait for types that can be converted to and from byte slices.
-pub unsafe trait PodUtils: Sized {
+pub trait PodUtils: Pod {
     /// Converts the implementing type to a slice of bytes.
     fn to_bytes(&self) -> &[u8];
 
@@ -119,7 +119,7 @@ pub unsafe trait PodUtils: Sized {
     }
 }
 
-unsafe impl<T: Pod> PodUtils for T {
+impl<T: Pod> PodUtils for T {
     #[inline]
     fn to_bytes(&self) -> &[u8] {
         bytemuck::bytes_of(self)
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_cast_ptr() {
-        let mut data = TestStruct { x: 42, y: 3.14 };
+        let mut data = TestStruct { x: 42, y: 3.143 };
         let ptr = &mut data as *mut TestStruct as *mut u8;
 
         unsafe {
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_cast_ptr_const() {
-        let data = TestStruct { x: 42, y: 3.14 };
+        let data = TestStruct { x: 42, y: 3.143 };
         let ptr = &data as *const TestStruct as *const u8;
 
         unsafe {
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_slurp() {
-        let mut data = [TestStruct { x: 42, y: 3.14 }, TestStruct { x: 10, y: 2.5 }];
+        let mut data = [TestStruct { x: 42, y: 3.143 }, TestStruct { x: 10, y: 2.5 }];
         let ptr = data.as_mut_ptr() as *mut u8;
 
         unsafe {
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_slurp_const() {
-        let data = [TestStruct { x: 42, y: 3.14 }, TestStruct { x: 10, y: 2.5 }];
+        let data = [TestStruct { x: 42, y: 3.143 }, TestStruct { x: 10, y: 2.5 }];
         let ptr = data.as_ptr() as *const u8;
 
         unsafe {
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_pod_vec() {
-        let data = TestStruct { x: 42, y: 3.14 };
+        let data = TestStruct { x: 42, y: 3.143 };
         let vec = data.to_vec();
 
         assert_eq!(vec.len(), std::mem::size_of::<TestStruct>());
