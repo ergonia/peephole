@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-solana-sdk = { version = "=1.18", default_features = false}
-solana-program = { version = "=1.18", default_features = false}
+solana-sdk = { version = "=1.18", default-features = false}
+solana-program = { version = "=1.18", default-features = false}
 bytemuck = { version = "1.18.0", features = ["derive"] }
 
 
