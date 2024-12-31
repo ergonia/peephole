@@ -31,10 +31,12 @@ trait Slurper {
 struct Dynamic;
 
 impl Slurper for Dynamic {
+    #[inline]
     fn get_account_size(size_in_data: &u64) -> u64 {
         *size_in_data
     }
 
+    #[inline]
     fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
         unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
     }
@@ -45,6 +47,7 @@ impl Slurper for Dynamic {
 struct TypedSlurper<T>(PhantomData<T>);
 
 impl<T: Copy> Slurper for TypedSlurper<T> {
+    #[inline]
     fn get_account_size(size_in_data: &u64) -> u64 {
         let known_size = std::mem::size_of::<T>() as u64;
         unsafe {
@@ -53,6 +56,7 @@ impl<T: Copy> Slurper for TypedSlurper<T> {
         known_size as u64
     }
 
+    #[inline]
     fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
         if std::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || std::mem::size_of::<T>() == 0 {
             ptr
@@ -959,7 +963,7 @@ mod tests {
                 TestAccountType::Empty(_) => {
                     let (acc, next) =
                         unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
-                    if acc.data().len() != 0 {
+                    if !acc.data().is_empty() {
                         return false;
                     }
                     iterator = next;
