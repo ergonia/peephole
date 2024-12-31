@@ -23,7 +23,6 @@ pub struct AccountIterator {
 }
 
 trait Slurper {
-    const ALIGNMENT: Option<usize>;
     fn get_account_size(size_in_data: &u64) -> u64;
     fn get_next_pointer(ptr: *mut u8) -> *mut u8;
 }
@@ -40,8 +39,20 @@ impl Slurper for Dynamic {
     fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
         unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
     }
+}
 
-    const ALIGNMENT: Option<usize> = None;
+struct Aligned;
+
+impl Slurper for Aligned {
+    #[inline]
+    fn get_account_size(size_in_data: &u64) -> u64 {
+        *size_in_data
+    }
+
+    #[inline]
+    fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
+        ptr
+    }
 }
 
 struct TypedSlurper<T>(PhantomData<T>);
@@ -64,8 +75,6 @@ impl<T> Slurper for TypedSlurper<T> {
             unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
         }
     }
-
-    const ALIGNMENT: Option<usize> = Some(std::mem::align_of::<T>());
 }
 
 impl AccountIterator {
@@ -155,6 +164,34 @@ impl AccountIterator {
         debug_assert_eq!(*is_dup, NON_DUP_MARKER);
 
         let (account, next) = self.slurp_real_account::<Dynamic>();
+
+        (account, unsafe {
+            AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
+        })
+    }
+
+    /// Retrieves the next full (non-duplicate) account.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it assumes the next account is a full account.
+    /// This also assumes that the account is aligned to an 8 byte boundary
+    /// The caller must ensure that this assumption holds true.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the next full account and the updated iterator.
+    #[inline]
+    pub unsafe fn aligned_known_next_full_account(
+        self,
+    ) -> (NonDupAccount<'static>, AccountIterator) {
+        debug_assert!(self.remaining_accounts > 0);
+
+        let is_dup = unsafe { &*self.base_ptr };
+
+        debug_assert_eq!(*is_dup, NON_DUP_MARKER);
+
+        let (account, next) = self.slurp_real_account::<Aligned>();
 
         (account, unsafe {
             AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
