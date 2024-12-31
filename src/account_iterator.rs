@@ -25,6 +25,7 @@ pub struct AccountIterator {
 trait Slurper {
     const ALIGNMENT: Option<usize>;
     fn get_account_size(size_in_data: &u64) -> u64;
+    fn get_next_pointer(ptr: *mut u8) -> *mut u8;
 }
 
 struct Dynamic;
@@ -32,6 +33,10 @@ struct Dynamic;
 impl Slurper for Dynamic {
     fn get_account_size(size_in_data: &u64) -> u64 {
         *size_in_data
+    }
+
+    fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
+        unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
     }
 
     const ALIGNMENT: Option<usize> = None;
@@ -46,6 +51,14 @@ impl<T: Copy> Slurper for TypedSlurper<T> {
             assume!(known_size == *size_in_data, "Known size is not real size");
         }
         known_size as u64
+    }
+
+    fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
+        if std::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || std::mem::size_of::<T>() == 0 {
+            ptr
+        } else {
+            unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
+        }
     }
 
     const ALIGNMENT: Option<usize> = Some(std::mem::align_of::<T>());
@@ -203,13 +216,7 @@ impl AccountIterator {
 
             let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
-            let next = match S::ALIGNMENT {
-                Some(alignment) if alignment % BPF_ALIGN_OF_U128 == 0 => {
-                    debug_assert_eq!(next.align_offset(BPF_ALIGN_OF_U128), 0);
-                    next
-                }
-                _ => next.add(next.align_offset(BPF_ALIGN_OF_U128)),
-            };
+            let next = S::get_next_pointer(next);
 
             let (rent_epoch, next) = slurp::<u64>(next);
 
@@ -727,5 +734,116 @@ mod tests {
         assert_eq!(data_as_struct.b, 2);
         assert_eq!(acc.static_data.is_signer, 1);
         assert_eq!(acc.static_data.is_writable, 1);
+    }
+
+    // Untyped account tests
+    #[test]
+    fn test_known_next_full_account_aligned_size() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // size % 8 == 0
+        let (account, _) = create_test_account(true, false, data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(acc.data(), data.as_slice());
+        assert_eq!(acc.static_data.data_len as usize, data.len());
+    }
+
+    #[test]
+    fn test_known_next_full_account_unaligned_size() {
+        let data = vec![1, 2, 3, 4, 5]; // size % 8 != 0
+        let (account, _) = create_test_account(true, false, data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(acc.data(), data.as_slice());
+        assert_eq!(acc.static_data.data_len as usize, data.len());
+    }
+
+    #[test]
+    fn test_known_next_full_account_zero_size() {
+        let data = vec![]; // zero size
+        let (account, _) = create_test_account(true, false, data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(acc.data(), data.as_slice());
+        assert_eq!(acc.static_data.data_len as usize, data.len());
+    }
+
+    // Typed account tests
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    struct AlignedStruct {
+        // 8-byte aligned
+        a: u64,
+        b: u64,
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    struct UnalignedStruct {
+        // Not 8-byte aligned
+        a: u16,
+        b: u8,
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    struct EmptyStruct {} // Zero-sized
+
+    fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts(data as *const _ as *const u8, std::mem::size_of::<T>())
+                .to_vec()
+        };
+
+        let (account, _) = create_test_account(true, true, data_bytes.clone());
+        create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![])
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_aligned() {
+        let aligned_data = AlignedStruct { a: 1, b: 2 };
+        let mut instruction = create_typed_test_instruction(&aligned_data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<AlignedStruct>() };
+
+        let data_as_struct = unsafe { &*(acc.data_ptr() as *const AlignedStruct) };
+        assert_eq!(data_as_struct.a, 1);
+        assert_eq!(data_as_struct.b, 2);
+        assert_eq!(acc.data().len(), std::mem::size_of::<AlignedStruct>());
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_unaligned() {
+        let unaligned_data = UnalignedStruct { a: 1, b: 2 };
+        let mut instruction = create_typed_test_instruction(&unaligned_data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<UnalignedStruct>() };
+
+        let data_as_struct = unsafe { &*(acc.data_ptr() as *const UnalignedStruct) };
+        assert_eq!(data_as_struct.a, 1);
+        assert_eq!(data_as_struct.b, 2);
+        assert_eq!(acc.data().len(), std::mem::size_of::<UnalignedStruct>());
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_empty() {
+        let empty_data = EmptyStruct {};
+        let mut instruction = create_typed_test_instruction(&empty_data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<EmptyStruct>() };
+
+        assert_eq!(acc.data().len(), 0);
+        assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
     }
 }
