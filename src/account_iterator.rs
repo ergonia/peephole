@@ -46,7 +46,7 @@ impl Slurper for Dynamic {
 
 struct TypedSlurper<T>(PhantomData<T>);
 
-impl<T: Copy> Slurper for TypedSlurper<T> {
+impl<T> Slurper for TypedSlurper<T> {
     #[inline]
     fn get_account_size(size_in_data: &u64) -> u64 {
         let known_size = std::mem::size_of::<T>() as u64;
@@ -175,7 +175,7 @@ impl AccountIterator {
     ///
     /// A tuple containing the next full account and the updated iterator.
     #[inline]
-    pub unsafe fn typed_known_next_full_account<T: Copy>(
+    pub unsafe fn typed_known_next_full_account<T>(
         self,
     ) -> (NonDupAccount<'static>, AccountIterator) {
         debug_assert!(self.remaining_accounts > 0);
