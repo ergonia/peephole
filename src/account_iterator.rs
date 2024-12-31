@@ -1,9 +1,11 @@
+use std::marker::PhantomData;
+
 use bytemuck::{Pod, Zeroable};
 use solana_program::entrypoint::{MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::entrypoint::BPF_ALIGN_OF_U128;
 
-use crate::bytes::slurp;
+use crate::{assume, bytes::slurp};
 
 pub enum AccountInInstruction {
     RealAccount(NonDupAccount<'static>),
@@ -18,6 +20,35 @@ pub enum NextAccount {
 pub struct AccountIterator {
     base_ptr: *mut u8,
     remaining_accounts: usize,
+}
+
+trait Slurper {
+    const ALIGNMENT: Option<usize>;
+    fn get_account_size(size_in_data: &u64) -> u64;
+}
+
+struct Dynamic;
+
+impl Slurper for Dynamic {
+    fn get_account_size(size_in_data: &u64) -> u64 {
+        *size_in_data
+    }
+
+    const ALIGNMENT: Option<usize> = None;
+}
+
+struct TypedSlurper<T>(PhantomData<T>);
+
+impl<T: Copy> Slurper for TypedSlurper<T> {
+    fn get_account_size(size_in_data: &u64) -> u64 {
+        let known_size = std::mem::size_of::<T>() as u64;
+        unsafe {
+            assume!(known_size == *size_in_data, "Known size is not real size");
+        }
+        known_size as u64
+    }
+
+    const ALIGNMENT: Option<usize> = Some(std::mem::align_of::<T>());
 }
 
 impl AccountIterator {
@@ -76,7 +107,7 @@ impl AccountIterator {
         } else {
             let is_dup = unsafe { *self.base_ptr };
             let (acc, next) = if is_dup == NON_DUP_MARKER {
-                let (non_dup, next) = self.slurp_real_account();
+                let (non_dup, next) = self.slurp_real_account::<Dynamic>();
                 (AccountInInstruction::RealAccount(non_dup), next)
             } else {
                 let next = unsafe { self.base_ptr.add(8) };
@@ -106,7 +137,37 @@ impl AccountIterator {
 
         debug_assert_eq!(*is_dup, NON_DUP_MARKER);
 
-        let (account, next) = self.slurp_real_account();
+        let (account, next) = self.slurp_real_account::<Dynamic>();
+
+        (account, unsafe {
+            AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
+        })
+    }
+
+    /// Retrieves the next full (non-duplicate) account. This call assumes that the account
+    /// exactly holds one of the type passed with no extra allocated data
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it assumes the next account is a full account,
+    /// and that the account exactly holds one of the type passed with no extra allocated data
+    ///
+    /// The caller must ensure that this assumption holds true.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the next full account and the updated iterator.
+    #[inline]
+    pub unsafe fn typed_known_next_full_account<T: Copy>(
+        self,
+    ) -> (NonDupAccount<'static>, AccountIterator) {
+        debug_assert!(self.remaining_accounts > 0);
+
+        let is_dup = unsafe { &*self.base_ptr };
+
+        debug_assert_eq!(*is_dup, NON_DUP_MARKER);
+
+        let (account, next) = self.slurp_real_account::<TypedSlurper<T>>();
 
         (account, unsafe {
             AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
@@ -134,15 +195,21 @@ impl AccountIterator {
     ///
     /// A tuple containing the NonDupAccount and a pointer to the next data.
     #[inline]
-    fn slurp_real_account(&self) -> (NonDupAccount<'static>, *mut u8) {
+    fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
         let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
         unsafe {
-            let data = std::slice::from_raw_parts_mut(next, account_static.data_len as usize);
+            let data_len = S::get_account_size(&account_static.data_len);
+            let data = std::slice::from_raw_parts_mut(next, data_len as usize);
 
             let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
-            // We could trim these CUs if we enforced that every account is aligned?
-            let next = next.add(next.align_offset(BPF_ALIGN_OF_U128));
+            let next = match S::ALIGNMENT {
+                Some(alignment) if alignment % BPF_ALIGN_OF_U128 == 0 => {
+                    debug_assert_eq!(next.align_offset(BPF_ALIGN_OF_U128), 0);
+                    next
+                }
+                _ => next.add(next.align_offset(BPF_ALIGN_OF_U128)),
+            };
 
             let (rent_epoch, next) = slurp::<u64>(next);
 
@@ -606,5 +673,59 @@ mod tests {
         } else {
             panic!("Expected first account");
         }
+    }
+
+    #[test]
+    fn test_known_next_full_account() {
+        let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(acc.data(), &[1, 2, 3, 4]);
+        assert_eq!(acc.static_data.is_signer, 1);
+        assert_eq!(acc.static_data.is_writable, 0);
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    struct TestStruct {
+        a: u32,
+        b: u32,
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account() {
+        let test_data = TestStruct { a: 1, b: 2 };
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &test_data as *const _ as *const u8,
+                std::mem::size_of::<TestStruct>(),
+            )
+            .to_vec()
+        };
+
+        let (account, _) = create_test_account(true, true, data_bytes);
+        let mut instruction = create_test_instruction(
+            vec![TestAccount::Real(account, unsafe {
+                std::slice::from_raw_parts(
+                    &test_data as *const _ as *const u8,
+                    std::mem::size_of::<TestStruct>(),
+                )
+                .to_vec()
+            })],
+            vec![],
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<TestStruct>() };
+
+        let data_as_struct = unsafe { &*(acc.data_ptr() as *const TestStruct) };
+        assert_eq!(data_as_struct.a, 1);
+        assert_eq!(data_as_struct.b, 2);
+        assert_eq!(acc.static_data.is_signer, 1);
+        assert_eq!(acc.static_data.is_writable, 1);
     }
 }
