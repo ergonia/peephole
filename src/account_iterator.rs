@@ -846,4 +846,135 @@ mod tests {
         assert_eq!(acc.data().len(), 0);
         assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
     }
+
+    #[derive(Debug, Copy, Clone)]
+    #[repr(C)]
+    struct QuickCheckAligned {
+        a: u64,
+        b: u64,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[repr(C)]
+    struct QuickCheckUnaligned {
+        a: u16,
+        b: u8,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[repr(C)]
+    struct QuickCheckEmpty {}
+
+    #[derive(Debug, Clone)]
+    enum TestAccountType {
+        Aligned(QuickCheckAligned),
+        Unaligned(QuickCheckUnaligned),
+        Empty(QuickCheckEmpty),
+        Untyped(Vec<u8>),
+    }
+
+    impl Arbitrary for TestAccountType {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            match u8::arbitrary(g) % 4 {
+                0 => TestAccountType::Aligned(QuickCheckAligned {
+                    a: u64::arbitrary(g),
+                    b: u64::arbitrary(g),
+                }),
+                1 => TestAccountType::Unaligned(QuickCheckUnaligned {
+                    a: u16::arbitrary(g),
+                    b: u8::arbitrary(g),
+                }),
+                2 => TestAccountType::Empty(QuickCheckEmpty {}),
+                _ => {
+                    let len = usize::arbitrary(g) % 32;
+                    let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
+                    TestAccountType::Untyped(data)
+                }
+            }
+        }
+    }
+
+    fn create_account_from_type(account_type: &TestAccountType) -> (NonDupAccountStatic, Vec<u8>) {
+        let data = match account_type {
+            TestAccountType::Aligned(aligned) => unsafe {
+                std::slice::from_raw_parts(
+                    aligned as *const _ as *const u8,
+                    std::mem::size_of::<QuickCheckAligned>(),
+                )
+                .to_vec()
+            },
+            TestAccountType::Unaligned(unaligned) => unsafe {
+                std::slice::from_raw_parts(
+                    unaligned as *const _ as *const u8,
+                    std::mem::size_of::<QuickCheckUnaligned>(),
+                )
+                .to_vec()
+            },
+            TestAccountType::Empty(_) => vec![],
+            TestAccountType::Untyped(data) => data.clone(),
+        };
+        create_test_account(
+            bool::arbitrary(&mut quickcheck::Gen::new(3)),
+            bool::arbitrary(&mut quickcheck::Gen::new(3)),
+            data,
+        )
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn quickcheck_mixed_account_types(account_types: Vec<TestAccountType>) -> bool {
+        if account_types.is_empty() {
+            return true;
+        }
+
+        let accounts: Vec<_> = account_types
+            .iter()
+            .map(|t| {
+                let (acc, data) = create_account_from_type(t);
+                TestAccount::Real(acc, data)
+            })
+            .collect();
+
+        let mut instruction = create_test_instruction(accounts, vec![]);
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        for account_type in account_types {
+            match account_type {
+                TestAccountType::Aligned(_) => {
+                    let (acc, next) =
+                        unsafe { iterator.typed_known_next_full_account::<QuickCheckAligned>() };
+                    if acc.data().len() != std::mem::size_of::<QuickCheckAligned>() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::Unaligned(_) => {
+                    let (acc, next) =
+                        unsafe { iterator.typed_known_next_full_account::<QuickCheckUnaligned>() };
+                    if acc.data().len() != std::mem::size_of::<QuickCheckUnaligned>() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::Empty(_) => {
+                    let (acc, next) =
+                        unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
+                    if acc.data().len() != 0 {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::Untyped(ref data) => {
+                    let (acc, next) = unsafe { iterator.known_next_full_account() };
+                    if acc.data() != data.as_slice() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+            }
+        }
+
+        // Verify we've reached the instruction data
+        matches!(iterator.next(), NextAccount::Data(_))
+    }
 }
