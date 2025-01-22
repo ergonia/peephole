@@ -120,6 +120,20 @@ impl AccountIterator {
         }
     }
 
+    #[inline]
+    /// Clones the iterator
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe as it exposes calls that give one mutable access to the underlying bytes
+    /// Ensure that you don't give yourself multiple mutable references
+    pub unsafe fn unsafe_clone(&self) -> Self {
+        Self {
+            base_ptr: self.base_ptr,
+            remaining_accounts: self.remaining_accounts,
+        }
+    }
+
     /// Advances the iterator and returns the next account or instruction data.
     ///
     /// # Returns
@@ -133,7 +147,7 @@ impl AccountIterator {
         } else {
             let is_dup = unsafe { *self.base_ptr };
             let (acc, next) = if is_dup == NON_DUP_MARKER {
-                let (non_dup, next) = self.slurp_real_account::<Dynamic>();
+                let (non_dup, next) = unsafe { self.slurp_real_account::<Dynamic>() };
                 (AccountInInstruction::RealAccount(non_dup), next)
             } else {
                 let next = unsafe { self.base_ptr.add(8) };
@@ -223,8 +237,58 @@ impl AccountIterator {
 
         let (account, next) = self.slurp_real_account::<TypedSlurper<T>>();
 
-        (account, unsafe {
-            AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
+        (
+            account,
+            AccountIterator::new_from_raw(next, self.remaining_accounts - 1),
+        )
+    }
+
+    /// Retrieves the next full (non-duplicate) account as a typed account.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it assumes the next account is a full account
+    /// and that the account exactly holds one of the type passed with no extra allocated data.
+    ///
+    /// The caller must ensure that this assumption holds true.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the next full account and the updated iterator.
+    #[inline]
+    pub unsafe fn static_slurp_typed_account<T: Pod + Zeroable>(
+        self,
+    ) -> (&'static mut TypedNonDupAccount<T>, AccountIterator) {
+        let (single_account, next) = self.static_slurp_typed_accounts::<T, 1>();
+        (&mut single_account[0], next)
+    }
+
+    /// Retrieves the next N full (non-duplicate) accounts as a typed array.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it assumes the next N accounts are full accounts
+    /// and that each account exactly holds one of the type passed with no extra allocated data.
+    ///
+    /// The caller must ensure that this assumption holds true.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the next N full accounts as an array and the updated iterator.
+    #[inline]
+    pub unsafe fn static_slurp_typed_accounts<T: Pod + Zeroable, const N: usize>(
+        self,
+    ) -> (&'static mut [TypedNonDupAccount<T>; N], AccountIterator)
+    where
+        [TypedNonDupAccount<T>; N]: Pod + Zeroable,
+    {
+        assume!(
+            self.remaining_accounts >= N,
+            "Too few accounts left for array slurp"
+        );
+        let (accounts, next) = self.slurp_typed_account::<T, N>();
+        (accounts, unsafe {
+            AccountIterator::new_from_raw(next, self.remaining_accounts - N)
         })
     }
 
@@ -249,26 +313,82 @@ impl AccountIterator {
     ///
     /// A tuple containing the NonDupAccount and a pointer to the next data.
     #[inline]
-    fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
+    unsafe fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
         let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
-        unsafe {
-            let data_len = S::get_account_size(&account_static.data_len);
-            let data = std::slice::from_raw_parts_mut(next, data_len as usize);
+        let data_len = S::get_account_size(&account_static.data_len);
+        let data = std::slice::from_raw_parts_mut(next, data_len as usize);
 
-            let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
-            let next = S::get_next_pointer(next);
+        let next = S::get_next_pointer(next);
 
-            let (rent_epoch, next) = slurp::<u64>(next);
+        let (rent_epoch, next) = slurp::<u64>(next);
 
-            let account = NonDupAccount {
-                static_data: account_static,
-                all_data: data,
-                rent_epoch,
-            };
+        let account = NonDupAccount {
+            static_data: account_static,
+            all_data: data,
+            rent_epoch,
+        };
 
-            (account, next)
+        (account, next)
+    }
+
+    #[inline]
+    unsafe fn slurp_typed_account<T: Pod + Zeroable, const N: usize>(
+        &self,
+    ) -> (&'static mut [TypedNonDupAccount<T>; N], *mut u8)
+    where
+        [TypedNonDupAccount<T>; N]: Pod + Zeroable,
+    {
+        assume!(
+            self.remaining_accounts >= N,
+            "Too few accounts left for array slurp"
+        );
+
+        assert_eq!(
+            std::mem::size_of::<T>() % 8,
+            0,
+            "Account size must be a multiple of 8"
+        );
+        assert_eq!(
+            std::mem::size_of::<[TypedNonDupAccount<T>; N]>() % 8,
+            0,
+            "Account size must be less than 8 bytes"
+        );
+
+        let (data, next_bytes) = slurp::<[TypedNonDupAccount<T>; N]>(self.base_ptr);
+
+        #[cfg(debug_assertions)]
+        {
+            let mut copy_of_self = self.unsafe_clone();
+
+            for _ in 0..N {
+                match copy_of_self.next() {
+                    NextAccount::Account(acc, next_iter) => {
+                        copy_of_self = next_iter;
+                        match acc {
+                            AccountInInstruction::RealAccount(acc) => {
+                                if acc.static_data.data_len != std::mem::size_of::<T>() as u64 {
+                                    panic!(
+                                        "Expected account size of {} but got {}",
+                                        std::mem::size_of::<T>() as u64,
+                                        acc.static_data.data_len
+                                    );
+                                }
+                            }
+                            AccountInInstruction::Dup(_) => {
+                                panic!("Expected a real account, found a duplicate")
+                            }
+                        }
+                    }
+                    NextAccount::Data(_) => panic!("Expected an account, found instruction data"),
+                }
+            }
+
+            assert_eq!(next_bytes, copy_of_self.base_ptr);
         }
+
+        (data, next_bytes)
     }
 
     /// Helper function to retrieve the instruction data.
@@ -323,6 +443,18 @@ pub struct NonDupAccount<'a> {
     pub all_data: &'a mut [u8],
     pub rent_epoch: &'a u64,
 }
+
+#[derive(PartialEq, Eq, Copy, Clone)]
+#[repr(C)]
+pub struct TypedNonDupAccount<T: Pod + Zeroable> {
+    pub static_data: NonDupAccountStatic,
+    pub data: T,
+    _buffer: [u8; MAX_PERMITTED_DATA_INCREASE],
+    pub rent_epoch: u64,
+}
+
+unsafe impl<T: Pod + Zeroable> Pod for TypedNonDupAccount<T> {}
+unsafe impl<T: Pod + Zeroable> Zeroable for TypedNonDupAccount<T> {}
 
 impl<'a> NonDupAccount<'a> {
     #[inline]
@@ -888,18 +1020,29 @@ mod tests {
         assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
     }
 
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
     #[repr(C)]
     struct QuickCheckAligned {
         a: u64,
         b: u64,
     }
 
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     #[repr(C)]
     struct QuickCheckUnaligned {
         a: u16,
         b: u8,
+    }
+
+    impl QuickCheckUnaligned {
+        fn to_vec(&self) -> Vec<u8> {
+            let rval = [&self.a.to_le_bytes()[..], &[self.b], &[0]].concat();
+
+            // tricky tricky.this is why we have pod enforcement everywhere
+            assert_eq!(rval.len(), std::mem::size_of::<QuickCheckUnaligned>());
+
+            rval
+        }
     }
 
     #[derive(Debug, Copy, Clone)]
@@ -908,61 +1051,96 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum TestAccountType {
-        Aligned(QuickCheckAligned),
-        Unaligned(QuickCheckUnaligned),
-        Empty(QuickCheckEmpty),
-        Untyped(Vec<u8>),
+        Aligned(QuickCheckAligned, bool, bool),
+        Unaligned(QuickCheckUnaligned, bool, bool),
+        Empty(QuickCheckEmpty, bool, bool),
+        Untyped(Vec<u8>, bool, bool),
+        AlignedArray([(QuickCheckAligned, bool, bool); 2]),
+        AlignedArray3([(QuickCheckAligned, bool, bool); 3]),
     }
 
     impl Arbitrary for TestAccountType {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            match u8::arbitrary(g) % 4 {
-                0 => TestAccountType::Aligned(QuickCheckAligned {
-                    a: u64::arbitrary(g),
-                    b: u64::arbitrary(g),
-                }),
-                1 => TestAccountType::Unaligned(QuickCheckUnaligned {
-                    a: u16::arbitrary(g),
-                    b: u8::arbitrary(g),
-                }),
-                2 => TestAccountType::Empty(QuickCheckEmpty {}),
-                _ => {
+            fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, bool, bool) {
+                (
+                    QuickCheckAligned {
+                        a: u64::arbitrary(g),
+                        b: u64::arbitrary(g),
+                    },
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                )
+            }
+            match u8::arbitrary(g) % 6 {
+                0 => TestAccountType::Aligned(
+                    QuickCheckAligned {
+                        a: u64::arbitrary(g),
+                        b: u64::arbitrary(g),
+                    },
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                ),
+                1 => TestAccountType::Unaligned(
+                    QuickCheckUnaligned {
+                        a: u16::arbitrary(g),
+                        b: u8::arbitrary(g),
+                    },
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                ),
+                2 => TestAccountType::Empty(
+                    QuickCheckEmpty {},
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                ),
+                3 => {
                     let len = usize::arbitrary(g) % 32;
                     let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
-                    TestAccountType::Untyped(data)
+                    TestAccountType::Untyped(data, bool::arbitrary(g), bool::arbitrary(g))
                 }
+                4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
+                _ => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
             }
         }
     }
 
-    fn create_account_from_type(account_type: &TestAccountType) -> (NonDupAccountStatic, Vec<u8>) {
-        let data = match account_type {
-            TestAccountType::Aligned(aligned) => unsafe {
-                std::slice::from_raw_parts(
-                    aligned as *const _ as *const u8,
-                    std::mem::size_of::<QuickCheckAligned>(),
-                )
-                .to_vec()
-            },
-            TestAccountType::Unaligned(unaligned) => unsafe {
-                std::slice::from_raw_parts(
-                    unaligned as *const _ as *const u8,
-                    std::mem::size_of::<QuickCheckUnaligned>(),
-                )
-                .to_vec()
-            },
-            TestAccountType::Empty(_) => vec![],
-            TestAccountType::Untyped(data) => data.clone(),
-        };
-        create_test_account(
-            bool::arbitrary(&mut quickcheck::Gen::new(3)),
-            bool::arbitrary(&mut quickcheck::Gen::new(3)),
-            data,
-        )
+    fn create_account_from_type(
+        account_type: TestAccountType,
+    ) -> Vec<(NonDupAccountStatic, Vec<u8>)> {
+        match account_type {
+            TestAccountType::Aligned(aligned, is_signer, is_writable) => {
+                let data = aligned.to_vec();
+                vec![create_test_account(is_signer, is_writable, data)]
+            }
+            TestAccountType::Unaligned(unaligned, is_signer, is_writable) => {
+                let data = unaligned.to_vec();
+                vec![create_test_account(is_signer, is_writable, data)]
+            }
+            TestAccountType::Empty(_, is_signer, is_writable) => {
+                vec![create_test_account(is_signer, is_writable, vec![])]
+            }
+            TestAccountType::Untyped(data, is_signer, is_writable) => {
+                vec![create_test_account(is_signer, is_writable, data.clone())]
+            }
+            TestAccountType::AlignedArray(array) => array
+                .iter()
+                .map(|(aligned, is_signer, is_writable)| {
+                    let data = aligned.to_vec();
+                    create_test_account(*is_signer, *is_writable, data)
+                })
+                .collect(),
+            TestAccountType::AlignedArray3(array) => array
+                .iter()
+                .map(|(aligned, is_signer, is_writable)| {
+                    let data = aligned.to_vec();
+                    create_test_account(*is_signer, *is_writable, data)
+                })
+                .collect(),
+        }
     }
 
     #[quickcheck_macros::quickcheck]
-    fn quickcheck_mixed_account_types(account_types: Vec<TestAccountType>) -> bool {
+    fn quickcheck_mixed_account_types_with_arrays(account_types: Vec<TestAccountType>) -> bool {
         if account_types.is_empty() {
             return true;
         }
@@ -970,9 +1148,12 @@ mod tests {
         let accounts: Vec<_> = account_types
             .iter()
             .map(|t| {
-                let (acc, data) = create_account_from_type(t);
-                TestAccount::Real(acc, data)
+                let accounts = create_account_from_type(t.clone());
+                accounts
+                    .into_iter()
+                    .map(|(acc, data)| TestAccount::Real(acc, data))
             })
+            .flatten()
             .collect();
 
         let mut instruction = create_test_instruction(accounts, vec![]);
@@ -981,34 +1162,109 @@ mod tests {
 
         for account_type in account_types {
             match account_type {
-                TestAccountType::Aligned(_) => {
+                TestAccountType::Aligned(al, is_signer, is_writable) => {
                     let (acc, next) =
-                        unsafe { iterator.typed_known_next_full_account::<QuickCheckAligned>() };
-                    if acc.data().len() != std::mem::size_of::<QuickCheckAligned>() {
+                        unsafe { iterator.static_slurp_typed_account::<QuickCheckAligned>() };
+                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckAligned>() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    if acc.data != al {
                         return false;
                     }
                     iterator = next;
                 }
-                TestAccountType::Unaligned(_) => {
+                TestAccountType::Unaligned(un, is_signer, is_writable) => {
                     let (acc, next) =
                         unsafe { iterator.typed_known_next_full_account::<QuickCheckUnaligned>() };
-                    if acc.data().len() != std::mem::size_of::<QuickCheckUnaligned>() {
+                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
+                    {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    let data_as_struct =
+                        unsafe { &*(acc.data().as_ptr() as *const QuickCheckUnaligned) };
+                    if data_as_struct != &un {
                         return false;
                     }
                     iterator = next;
                 }
-                TestAccountType::Empty(_) => {
+                TestAccountType::Empty(_, is_signer, is_writable) => {
                     let (acc, next) =
                         unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
-                    if !acc.data().is_empty() {
+                    if acc.static_data.data_len != 0 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
                         return false;
                     }
                     iterator = next;
                 }
-                TestAccountType::Untyped(ref data) => {
+                TestAccountType::Untyped(data, is_signer, is_writable) => {
                     let (acc, next) = unsafe { iterator.known_next_full_account() };
                     if acc.data() != data.as_slice() {
                         return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::AlignedArray(array) => {
+                    let (accs, next) =
+                        unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 2>() };
+                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
+                        if acc.static_data.data_len
+                            != std::mem::size_of::<QuickCheckAligned>() as u64
+                        {
+                            return false;
+                        }
+                        if (acc.static_data.is_signer == 1) != *is_signer {
+                            return false;
+                        }
+                        if (acc.static_data.is_writable == 1) != *is_writable {
+                            return false;
+                        }
+                        if &acc.data != given {
+                            return false;
+                        }
+                    }
+                    iterator = next;
+                }
+                TestAccountType::AlignedArray3(array) => {
+                    let (accs, next) =
+                        unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 3>() };
+                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
+                        if acc.static_data.data_len
+                            != std::mem::size_of::<QuickCheckAligned>() as u64
+                        {
+                            return false;
+                        }
+                        if (acc.static_data.is_signer == 1) != *is_signer {
+                            return false;
+                        }
+                        if (acc.static_data.is_writable == 1) != *is_writable {
+                            return false;
+                        }
+                        if &acc.data != given {
+                            return false;
+                        }
                     }
                     iterator = next;
                 }
