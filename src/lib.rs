@@ -32,4 +32,5 @@
 pub mod account_iterator;
 pub mod assume;
 pub mod bytes;
+pub mod pubkey_byte_map;
 pub mod utils;
