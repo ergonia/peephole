@@ -20,9 +20,10 @@ impl PubkeyMap {
     /// Returns true if the given public key is contained in the map.
     #[inline]
     pub fn contains(&self, key: &Pubkey) -> bool {
-        let key_bytes: [u8; 32] = key.to_bytes();
-        let first = key_bytes[0] as usize;
         unsafe {
+            // the as_ref and as_bytes calls are not inlined properly lol
+            let key_as_bytes: &[u8;32] = std::mem::transmute(key);
+            let first = *key_as_bytes.get_unchecked(0) as usize;
             // I don't trust compiler to elide bounds check
             fast_cmp_pubkey(key, self.0.get_unchecked(first))
         }
