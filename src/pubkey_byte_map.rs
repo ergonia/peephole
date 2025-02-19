@@ -1,3 +1,4 @@
+use bytemuck::{Pod, Zeroable};
 use solana_sdk::pubkey::Pubkey;
 
 use crate::utils::fast_cmp_pubkey;
@@ -14,7 +15,9 @@ const fn bytes_equal(a: [u8; 32], b: [u8; 32]) -> bool {
     true
 }
 
-pub struct PubkeyMap([Pubkey; 256]);
+#[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct PubkeyMap(pub [Pubkey; 256]);
 
 impl PubkeyMap {
     /// Returns true if the given public key is contained in the map.
@@ -22,7 +25,7 @@ impl PubkeyMap {
     pub fn contains(&self, key: &Pubkey) -> bool {
         unsafe {
             // the as_ref and as_bytes calls are not inlined properly lol
-            let key_as_bytes: &[u8;32] = std::mem::transmute(key);
+            let key_as_bytes: &[u8; 32] = std::mem::transmute(key);
             let first = *key_as_bytes.get_unchecked(0) as usize;
             // I don't trust compiler to elide bounds check
             fast_cmp_pubkey(key, self.0.get_unchecked(first))
@@ -30,11 +33,43 @@ impl PubkeyMap {
     }
 }
 
+/// Creates a new `PubkeyMap` from the given slice of public keys,
+/// in the existing map
+///
+/// # Panics
+///
+/// Panics if `keys` contains more than 256 elements or if any two keys share the same first byte.
+pub fn try_pubkey_byte_map(keys: &[Pubkey], key_map: &mut PubkeyMap) -> Result<(), &'static str> {
+    if keys.len() > 256 {
+        return Err("keys length must be less than 256");
+    }
+
+    let zero_bytes: [u8; 32] = [0; 32];
+    let zero = Pubkey::new_from_array(zero_bytes);
+
+    for k in &mut key_map.0 {
+        *k = zero;
+    }
+
+    for (i, key) in keys.iter().enumerate() {
+        let key_bytes: [u8; 32] = key.to_bytes();
+        let first = key_bytes[0] as usize;
+        if bytes_equal(key_map.0[first].to_bytes(), zero_bytes) {
+            key_map.0[first] = *key;
+        } else {
+            return Err(ERROR_MSGS[i]);
+        }
+    }
+
+    Ok(())
+}
+
 /// Creates a new `PubkeyMap` from the given slice of public keys.
 ///
 /// # Panics
 ///
 /// Panics if `keys` contains more than 256 elements or if any two keys share the same first byte.
+#[inline(always)]
 pub const fn pubkey_byte_map(keys: &[Pubkey]) -> PubkeyMap {
     if keys.len() > 256 {
         panic!("keys length must be less than 256");
@@ -380,6 +415,75 @@ mod tests {
 
         let keys = &[key1];
         let map = pubkey_byte_map(keys);
+
+        assert!(map.contains(&key1));
+        assert!(!map.contains(&key2));
+    }
+
+    #[test]
+    fn test_try_pubkey_byte_map() {
+        let key1 = Pubkey::new_from_array([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+        let key2 = Pubkey::new_from_array([
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+            0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,
+            0x2d, 0x2e, 0x2f, 0x30,
+        ]);
+        let key3 = Pubkey::new_from_array([
+            0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x40, 0x41,
+        ]);
+
+        let keys = &[key1, key2];
+        let mut map = PubkeyMap([Pubkey::default(); 256]);
+        assert!(try_pubkey_byte_map(keys, &mut map).is_ok());
+
+        assert!(map.contains(&key1));
+        assert!(map.contains(&key2));
+        assert!(!map.contains(&key3));
+    }
+
+    #[test]
+    fn test_try_pubkey_byte_map_too_many_keys() {
+        let keys: Vec<_> = (0..300).map(|_| Pubkey::new_unique()).collect();
+        let mut map = PubkeyMap([Pubkey::default(); 256]);
+        assert_eq!(
+            try_pubkey_byte_map(&keys, &mut map),
+            Err("keys length must be less than 256")
+        );
+    }
+
+    #[test]
+    fn test_try_pubkey_byte_map_duplicate_first_bytes() {
+        let key1 = Pubkey::new_unique();
+        let keys = &[key1, key1];
+        let mut map = PubkeyMap([Pubkey::default(); 256]);
+        assert_eq!(
+            try_pubkey_byte_map(keys, &mut map),
+            Err("Key 1 shares the same first byte as another key")
+        );
+    }
+
+    #[test]
+    fn test_try_pubkey_byte_map_non_matching_keys_with_same_first_byte() {
+        let key1 = Pubkey::new_from_array([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+        let key2 = Pubkey::new_from_array([
+            0x00, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3,
+            0xf2, 0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5,
+            0xe4, 0xe3, 0xe2, 0xe1,
+        ]);
+
+        let keys = &[key1];
+        let mut map = PubkeyMap([Pubkey::default(); 256]);
+        assert!(try_pubkey_byte_map(keys, &mut map).is_ok());
 
         assert!(map.contains(&key1));
         assert!(!map.contains(&key2));

@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     impl QuickCheckUnaligned {
-        fn to_vec(&self) -> Vec<u8> {
+        fn create_vec(&self) -> Vec<u8> {
             let rval = [&self.a.to_le_bytes()[..], &[self.b], &[0]].concat();
 
             // tricky tricky.this is why we have pod enforcement everywhere
@@ -1113,7 +1113,7 @@ mod tests {
                 vec![create_test_account(is_signer, is_writable, data)]
             }
             TestAccountType::Unaligned(unaligned, is_signer, is_writable) => {
-                let data = unaligned.to_vec();
+                let data = unaligned.create_vec();
                 vec![create_test_account(is_signer, is_writable, data)]
             }
             TestAccountType::Empty(_, is_signer, is_writable) => {
@@ -1147,13 +1147,12 @@ mod tests {
 
         let accounts: Vec<_> = account_types
             .iter()
-            .map(|t| {
+            .flat_map(|t| {
                 let accounts = create_account_from_type(t.clone());
                 accounts
                     .into_iter()
                     .map(|(acc, data)| TestAccount::Real(acc, data))
             })
-            .flatten()
             .collect();
 
         let mut instruction = create_test_instruction(accounts, vec![]);
