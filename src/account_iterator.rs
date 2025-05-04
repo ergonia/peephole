@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use bytemuck::{Pod, Zeroable};
-use solana_sdk::entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
-use solana_sdk::pubkey::Pubkey;
+use solana_program::entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
+use solana_program::pubkey::Pubkey;
 
 use crate::{assume, bytes::slurp};
 
@@ -478,7 +478,7 @@ pub mod arbitrary_impls {
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
 
-    use solana_sdk::pubkey::Pubkey;
+    use solana_program::pubkey::Pubkey;
     use std::rc::Rc;
 
     use crate::bytes::PodUtils;
@@ -486,7 +486,7 @@ pub mod arbitrary_impls {
     use super::*;
     #[cfg(test)]
     use quickcheck::Arbitrary;
-    use solana_sdk::entrypoint;
+    use solana_program::entrypoint;
 
     #[derive(Clone, Debug)]
     pub enum TestAccount {
@@ -1011,18 +1011,8 @@ pub mod arbitrary_impls {
                         return false;
                     }
                 }
-                AccountInInstruction::Dup(fast_dup_index) => {
-                    // Check if Solana account *is* a duplicate by checking Rc ptr equality
-                    let original_solana_acc = &accounts_solana[*fast_dup_index];
-                    if !Rc::ptr_eq(&original_solana_acc.lamports, &solana_acc.lamports)
-                        || !Rc::ptr_eq(&original_solana_acc.data, &solana_acc.data)
-                        || original_solana_acc.key != solana_acc.key
-                    // Sanity check key too
-                    {
-                        eprintln!("Account type mismatch at index {}: Fast=Duplicate({}), Solana=Real or wrong duplicate", i, fast_dup_index);
-                        return false;
-                    }
-                    // No need to compare fields further, Rc::ptr_eq confirms it's a clone of the correct original
+                AccountInInstruction::Dup(_) => {
+                    panic!("We do not fuzz dups yet")
                 }
             }
         }
