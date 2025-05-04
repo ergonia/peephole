@@ -475,12 +475,16 @@ impl<'a> NonDupAccount<'a> {
 #[cfg(any(test, fuzzing))]
 pub mod arbitrary_impls {
 
+    #[cfg(all(test, fuzzing))]
+    compile_error!("fuzzing and test cannot both be true");
+
     use solana_sdk::pubkey::Pubkey;
     use std::rc::Rc;
 
     use crate::bytes::PodUtils;
 
     use super::*;
+    #[cfg(test)]
     use quickcheck::Arbitrary;
     use solana_sdk::entrypoint;
 
@@ -490,10 +494,12 @@ pub mod arbitrary_impls {
         Duplicate(u8),
     }
 
+    #[cfg(test)]
     fn arbitrary_array<T: Arbitrary>(g: &mut quickcheck::Gen) -> [T; 32] {
         std::array::from_fn(|_| T::arbitrary(g))
     }
 
+    #[cfg(test)]
     impl Arbitrary for TestAccount {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
             let should_be_dup = u8::arbitrary(g) < 200;
@@ -577,6 +583,7 @@ pub mod arbitrary_impls {
 
     // Typed account tests
     #[derive(Copy, Clone)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct AlignedStruct {
         // 8-byte aligned
@@ -585,6 +592,7 @@ pub mod arbitrary_impls {
     }
 
     #[derive(Copy, Clone)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct UnalignedStruct {
         // Not 8-byte aligned
@@ -593,6 +601,7 @@ pub mod arbitrary_impls {
     }
 
     #[derive(Copy, Clone)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct EmptyStruct {} // Zero-sized
 
@@ -606,6 +615,7 @@ pub mod arbitrary_impls {
         create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![])
     }
     #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct QuickCheckAligned {
         pub a: u64,
@@ -613,6 +623,7 @@ pub mod arbitrary_impls {
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct QuickCheckUnaligned {
         pub a: u16,
@@ -631,10 +642,12 @@ pub mod arbitrary_impls {
     }
 
     #[derive(Debug, Copy, Clone)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct QuickCheckEmpty {}
 
     #[derive(Debug, Clone)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     pub enum TestAccountType {
         Aligned(QuickCheckAligned, bool, bool),
         Unaligned(QuickCheckUnaligned, bool, bool),
@@ -644,6 +657,7 @@ pub mod arbitrary_impls {
         AlignedArray3([(QuickCheckAligned, bool, bool); 3]),
     }
 
+    #[cfg(test)]
     impl Arbitrary for TestAccountType {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
             fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, bool, bool) {
@@ -1019,13 +1033,8 @@ pub mod arbitrary_impls {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
-    use crate::bytes::PodUtils;
 
     use super::*;
-    use quickcheck::Arbitrary;
-    use solana_sdk::entrypoint;
 
     use super::arbitrary_impls::*;
 
