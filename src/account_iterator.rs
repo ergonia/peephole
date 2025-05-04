@@ -1,9 +1,8 @@
 use std::marker::PhantomData;
 
 use bytemuck::{Pod, Zeroable};
-use solana_program::entrypoint::{MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
-use solana_program::pubkey::Pubkey;
-use solana_sdk::entrypoint::BPF_ALIGN_OF_U128;
+use solana_sdk::entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
+use solana_sdk::pubkey::Pubkey;
 
 use crate::{assume, bytes::slurp};
 
@@ -475,11 +474,14 @@ impl<'a> NonDupAccount<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use crate::bytes::PodUtils;
 
     use super::*;
     use quickcheck::Arbitrary;
-    use solana_program::pubkey::Pubkey;
+    use solana_sdk::entrypoint;
+    use solana_sdk::pubkey::Pubkey;
 
     #[derive(Clone, Debug)]
     enum TestAccount {
@@ -1141,6 +1143,12 @@ mod tests {
 
     #[quickcheck_macros::quickcheck]
     fn quickcheck_mixed_account_types_with_arrays(account_types: Vec<TestAccountType>) -> bool {
+        do_quickcheck_mixed_account_types_with_arrays(account_types)
+    }
+
+    pub fn do_quickcheck_mixed_account_types_with_arrays(
+        account_types: Vec<TestAccountType>,
+    ) -> bool {
         if account_types.is_empty() {
             return true;
         }
@@ -1272,5 +1280,165 @@ mod tests {
 
         // Verify we've reached the instruction data
         matches!(iterator.next(), NextAccount::Data(_))
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn quickcheck_compare_with_solana_deserialize(
+        account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
+    ) -> bool {
+        do_quickcheck_compare_with_solana_deserialize(account_types, instruction_data_gen)
+    }
+
+    pub fn do_quickcheck_compare_with_solana_deserialize(
+        account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
+    ) -> bool {
+        // 1. Generate TestAccount structures from TestAccountType
+        let test_accounts: Vec<_> = account_types
+            .iter()
+            .flat_map(|t| {
+                let accounts = create_account_from_type(t.clone());
+                accounts
+                    .into_iter()
+                    .map(|(acc, data)| TestAccount::Real(acc, data))
+            })
+            .collect();
+
+        // 2. Create the instruction buffer
+        let mut instruction_buffer =
+            create_test_instruction(test_accounts.clone(), instruction_data_gen.clone());
+
+        // 3. Parse with AccountIterator
+        let mut fast_results = Vec::new();
+        let mut fast_iter =
+            unsafe { AccountIterator::new_from_instruction(instruction_buffer.as_mut_ptr()) };
+        let final_fast_data = loop {
+            match fast_iter.next() {
+                NextAccount::Account(acc, next_iter) => {
+                    fast_results.push(acc);
+                    fast_iter = next_iter;
+                }
+                NextAccount::Data(data) => {
+                    break data.to_vec(); // Clone data for comparison
+                }
+            }
+        };
+
+        // 4. Parse with solana_program::entrypoint::deserialize
+        let (_program_id_solana, accounts_solana, instruction_data_solana) =
+            unsafe { entrypoint::deserialize(instruction_buffer.as_mut_ptr()) };
+
+        // 5. Compare results
+
+        // Compare instruction data
+        if instruction_data_solana != final_fast_data.as_slice() {
+            eprintln!(
+                "Instruction data mismatch: Solana={:?}, Fast={:?}",
+                instruction_data_solana, final_fast_data
+            );
+            return false;
+        }
+
+        // Compare number of accounts
+        if fast_results.len() != accounts_solana.len() {
+            eprintln!(
+                "Account count mismatch: Solana={}, Fast={}",
+                accounts_solana.len(),
+                fast_results.len()
+            );
+            return false;
+        }
+
+        // Compare each account
+        for (i, (fast_acc, solana_acc)) in
+            fast_results.iter().zip(accounts_solana.iter()).enumerate()
+        {
+            match fast_acc {
+                AccountInInstruction::RealAccount(fast_real) => {
+                    // Check if Solana account is *not* a duplicate derived one.
+                    // Solana's deserialize clones AccountInfo for duplicates. We rely on Rc ptr equality
+                    // to differentiate original from cloned duplicates for this check.
+                    // If it's not the first account, check it wasn't cloned from a previous one.
+                    let is_solana_original = if i > 0 {
+                        let mut found_clone = false;
+                        for j in 0..i {
+                            if Rc::ptr_eq(&accounts_solana[j].lamports, &solana_acc.lamports)
+                                && Rc::ptr_eq(&accounts_solana[j].data, &solana_acc.data)
+                                && accounts_solana[j].key == solana_acc.key
+                            // Key comparison as extra safety
+                            {
+                                found_clone = true;
+                                break;
+                            }
+                        }
+                        !found_clone
+                    } else {
+                        true // First account is always original if present
+                    };
+
+                    if !is_solana_original {
+                        eprintln!(
+                            "Account type mismatch at index {}: Fast=Real, Solana=Duplicate",
+                            i
+                        );
+                        return false;
+                    }
+
+                    // Compare fields
+                    if fast_real.static_data.key != *solana_acc.key {
+                        eprintln!("Key mismatch at index {}", i);
+                        return false;
+                    }
+                    if (fast_real.static_data.is_signer != 0) != solana_acc.is_signer {
+                        eprintln!("is_signer mismatch at index {}", i);
+                        return false;
+                    }
+                    if (fast_real.static_data.is_writable != 0) != solana_acc.is_writable {
+                        eprintln!("is_writable mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.owner != *solana_acc.owner {
+                        eprintln!("Owner mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.lamports != **(solana_acc.lamports.borrow()) {
+                        eprintln!("Lamports mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.data_len != solana_acc.data.borrow().len() as u64 {
+                        eprintln!("Data length mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.data() != *solana_acc.data.borrow() {
+                        eprintln!("Data mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.executable != solana_acc.executable as u8 {
+                        eprintln!("Executable mismatch at index {}", i);
+                        return false;
+                    }
+                    if *fast_real.rent_epoch != solana_acc.rent_epoch {
+                        eprintln!("Rent epoch mismatch at index {}", i);
+                        return false;
+                    }
+                }
+                AccountInInstruction::Dup(fast_dup_index) => {
+                    // Check if Solana account *is* a duplicate by checking Rc ptr equality
+                    let original_solana_acc = &accounts_solana[*fast_dup_index];
+                    if !Rc::ptr_eq(&original_solana_acc.lamports, &solana_acc.lamports)
+                        || !Rc::ptr_eq(&original_solana_acc.data, &solana_acc.data)
+                        || original_solana_acc.key != solana_acc.key
+                    // Sanity check key too
+                    {
+                        eprintln!("Account type mismatch at index {}: Fast=Duplicate({}), Solana=Real or wrong duplicate", i, fast_dup_index);
+                        return false;
+                    }
+                    // No need to compare fields further, Rc::ptr_eq confirms it's a clone of the correct original
+                }
+            }
+        }
+
+        true // All checks passed
     }
 }
