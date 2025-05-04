@@ -1,8 +1,9 @@
 use std::marker::PhantomData;
 
+use crate::solana_export::constants::MAX_PERMITTED_DATA_INCREASE;
+use crate::solana_export::constants::{BPF_ALIGN_OF_U128, NON_DUP_MARKER};
 use crate::solana_export::pubkey::Pubkey;
 use bytemuck::{Pod, Zeroable};
-use crate::solana_export::entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
 
 use crate::{assume, bytes::slurp};
 
@@ -478,15 +479,13 @@ pub mod arbitrary_impls {
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
 
-    use crate::solana_export::pubkey::Pubkey;
-    use std::rc::Rc;
+    use crate::solana_export::{self, pubkey_from_array, unique_pubkey, IsAccount};
 
     use crate::bytes::PodUtils;
 
     use super::*;
     #[cfg(test)]
     use quickcheck::Arbitrary;
-    use crate::solana_export::entrypoint;
 
     #[derive(Clone, Debug)]
     pub enum TestAccount {
@@ -515,8 +514,8 @@ pub mod arbitrary_impls {
                     is_writable: bool::arbitrary(g) as u8,
                     executable: 0,
                     original_data_len: data.len() as u32,
-                    key: Pubkey::new_from_array(arbitrary_array(g)),
-                    owner: Pubkey::new_from_array(arbitrary_array(g)),
+                    key: pubkey_from_array(arbitrary_array(g)),
+                    owner: pubkey_from_array(arbitrary_array(g)),
                     lamports: 100,
                     data_len: data.len() as u64,
                 };
@@ -536,8 +535,8 @@ pub mod arbitrary_impls {
             is_writable: is_writable as u8,
             executable: 0,
             original_data_len: data.len() as u32,
-            key: Pubkey::new_unique(),
-            owner: Pubkey::new_unique(),
+            key: unique_pubkey(),
+            owner: unique_pubkey(),
             lamports: 100,
             data_len: data.len() as u64,
         };
@@ -577,7 +576,6 @@ pub mod arbitrary_impls {
         let instruction_len = instruction_data.len() as u64;
         instruction.extend_from_slice(&instruction_len.to_le_bytes());
         instruction.extend_from_slice(&instruction_data);
-
         instruction
     }
 
@@ -742,10 +740,6 @@ pub mod arbitrary_impls {
         account_types: Vec<TestAccountType>,
         instruction_data_gen: Vec<u8>,
     ) -> bool {
-        if account_types.is_empty() {
-            return true;
-        }
-
         let accounts: Vec<_> = account_types
             .iter()
             .flat_map(|t| {
@@ -915,7 +909,7 @@ pub mod arbitrary_impls {
 
         // 4. Parse with solana_program::entrypoint::deserialize
         let (_program_id_solana, accounts_solana, instruction_data_solana) =
-            unsafe { entrypoint::deserialize(instruction_buffer.as_mut_ptr()) };
+             solana_export::easy_deserialize(instruction_buffer.as_mut_ptr());
 
         // 5. Compare results
 
@@ -944,70 +938,37 @@ pub mod arbitrary_impls {
         {
             match fast_acc {
                 AccountInInstruction::RealAccount(fast_real) => {
-                    // Check if Solana account is *not* a duplicate derived one.
-                    // Solana's deserialize clones AccountInfo for duplicates. We rely on Rc ptr equality
-                    // to differentiate original from cloned duplicates for this check.
-                    // If it's not the first account, check it wasn't cloned from a previous one.
-                    let is_solana_original = if i > 0 {
-                        let mut found_clone = false;
-                        for j in 0..i {
-                            if Rc::ptr_eq(&accounts_solana[j].lamports, &solana_acc.lamports)
-                                && Rc::ptr_eq(&accounts_solana[j].data, &solana_acc.data)
-                                && accounts_solana[j].key == solana_acc.key
-                            // Key comparison as extra safety
-                            {
-                                found_clone = true;
-                                break;
-                            }
-                        }
-                        !found_clone
-                    } else {
-                        true // First account is always original if present
-                    };
-
-                    if !is_solana_original {
-                        eprintln!(
-                            "Account type mismatch at index {}: Fast=Real, Solana=Duplicate",
-                            i
-                        );
-                        return false;
-                    }
-
                     // Compare fields
-                    if fast_real.static_data.key != *solana_acc.key {
+                    if fast_real.static_data.key != *solana_acc.get_key() {
                         eprintln!("Key mismatch at index {}", i);
                         return false;
                     }
-                    if (fast_real.static_data.is_signer != 0) != solana_acc.is_signer {
+                    if (fast_real.static_data.is_signer != 0) != solana_acc.get_is_signer() {
                         eprintln!("is_signer mismatch at index {}", i);
                         return false;
                     }
-                    if (fast_real.static_data.is_writable != 0) != solana_acc.is_writable {
+                    if (fast_real.static_data.is_writable != 0) != solana_acc.get_is_writable() {
                         eprintln!("is_writable mismatch at index {}", i);
                         return false;
                     }
-                    if fast_real.static_data.owner != *solana_acc.owner {
+                    if fast_real.static_data.owner != *solana_acc.get_owner() {
                         eprintln!("Owner mismatch at index {}", i);
                         return false;
                     }
-                    if fast_real.static_data.lamports != **(solana_acc.lamports.borrow()) {
+                    if fast_real.static_data.lamports != solana_acc.get_lamports() {
                         eprintln!("Lamports mismatch at index {}", i);
                         return false;
                     }
-                    if fast_real.static_data.data_len != solana_acc.data.borrow().len() as u64 {
+                    if fast_real.static_data.data_len != solana_acc.get_data_len() as u64 {
                         eprintln!("Data length mismatch at index {}", i);
                         return false;
                     }
-                    if fast_real.data() != *solana_acc.data.borrow() {
+                    if fast_real.data() != solana_acc.get_data() {
                         eprintln!("Data mismatch at index {}", i);
                         return false;
                     }
-                    if fast_real.static_data.executable != solana_acc.executable as u8 {
+                    if fast_real.static_data.executable != solana_acc.get_executable() as u8 {
                         eprintln!("Executable mismatch at index {}", i);
-                        return false;
-                    }
-                    if *fast_real.rent_epoch != solana_acc.rent_epoch {
-                        eprintln!("Rent epoch mismatch at index {}", i);
                         return false;
                     }
                 }

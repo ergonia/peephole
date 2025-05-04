@@ -24,10 +24,13 @@
 //! This library contains unsafe code and should be used with caution. It's designed
 //! for performance-critical scenarios in Solana smart contract development. Ensure
 //! you understand the implications of using these optimizations before incorporating
-//! them into your project.
+//! them into your project. Many of the unsafe acount parsing functions are only usable
+//! in permissioned code *after* the permissioning has been done in a safe way
 //!
 //! For more detailed information, refer to the documentation of individual modules
-//! and functions.
+//!
+
+#![allow(unexpected_cfgs)]
 
 pub mod account_iterator;
 pub mod assume;

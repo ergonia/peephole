@@ -34,7 +34,7 @@ use crate::solana_export::pubkey::Pubkey;
 /// use fast_instruction::solana_export::pubkey::Pubkey;
 /// use fast_instruction::utils::fast_cmp_pubkey;
 ///
-/// let pubkey1 = Pubkey::new_unique();
+/// let pubkey1 = Pubkey::default();
 /// let pubkey2 = pubkey1;
 /// assert!(fast_cmp_pubkey(&pubkey1, &pubkey2));
 /// ```
@@ -53,6 +53,8 @@ pub fn fast_cmp_pubkey(a: &Pubkey, b: &Pubkey) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::solana_export::{pubkey_from_array, unique_pubkey};
+
     use super::*;
 
     #[quickcheck_macros::quickcheck]
@@ -60,8 +62,8 @@ mod tests {
     fn quickcheck_fast_cmp_pubkey_equal(a: (u64, u64, u64, u64), b: (u64, u64, u64, u64)) {
         let a = unsafe { std::mem::transmute(a) };
         let b = unsafe { std::mem::transmute(b) };
-        let pubkey_a = Pubkey::new_from_array(a);
-        let pubkey_b = Pubkey::new_from_array(b);
+        let pubkey_a = pubkey_from_array(a);
+        let pubkey_b = pubkey_from_array(b);
 
         assert_eq!(a == b, pubkey_a == pubkey_b);
         assert_eq!(fast_cmp_pubkey(&pubkey_a, &pubkey_b), pubkey_a == pubkey_b);
@@ -69,15 +71,15 @@ mod tests {
 
     #[test]
     fn test_fast_cmp_pubkey_equal() {
-        let pubkey1 = Pubkey::new_unique();
+        let pubkey1 = unique_pubkey();
         let pubkey2 = pubkey1;
         assert!(fast_cmp_pubkey(&pubkey1, &pubkey2));
     }
 
     #[test]
     fn test_fast_cmp_pubkey_not_equal() {
-        let pubkey1 = Pubkey::new_unique();
-        let pubkey2 = Pubkey::new_unique();
+        let pubkey1 = unique_pubkey();
+        let pubkey2 = unique_pubkey();
         assert!(!fast_cmp_pubkey(&pubkey1, &pubkey2));
     }
 
@@ -85,14 +87,14 @@ mod tests {
     fn test_fast_cmp_pubkey_zero() {
         let zero_pubkey = Pubkey::default();
         assert!(fast_cmp_pubkey(&zero_pubkey, &zero_pubkey));
-        assert!(!fast_cmp_pubkey(&zero_pubkey, &Pubkey::new_unique()));
+        assert!(!fast_cmp_pubkey(&zero_pubkey, &unique_pubkey()));
     }
 
     #[test]
     fn test_fast_cmp_pubkey_known_values() {
-        let pubkey1 = Pubkey::new_from_array([1; 32]);
-        let pubkey2 = Pubkey::new_from_array([1; 32]);
-        let pubkey3 = Pubkey::new_from_array([2; 32]);
+        let pubkey1 = pubkey_from_array([1; 32]);
+        let pubkey2 = pubkey_from_array([1; 32]);
+        let pubkey3 = pubkey_from_array([2; 32]);
 
         assert!(fast_cmp_pubkey(&pubkey1, &pubkey2));
         assert!(!fast_cmp_pubkey(&pubkey1, &pubkey3));
