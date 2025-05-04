@@ -24,6 +24,7 @@ macro_rules! assume {
     ($cond:expr, $rest:tt) => {
         let _value: bool = $cond;
 
+        #[cfg(not(fuzzing))]
         debug_assert!(_value, $rest);
 
         if !_value {
@@ -60,6 +61,7 @@ macro_rules! assume_matches {
             $pattern $(if $guard)? => $result,
             _ => {
                 let msg = stringify!($expr => $pattern $(if $guard)?);
+                #[cfg(not(fuzzing))]
                 debug_assert!(false, "{}", msg);
                 std::hint::unreachable_unchecked()
             },
@@ -96,6 +98,7 @@ macro_rules! assume_offset {
         #[cfg(debug_assertions)]
         {
             let offset = $ptr.offset_from($init);
+            #[cfg(not(fuzzing))]
             debug_assert_eq!(offset, $expected as isize, $rest);
         }
         if $ptr != $init.add($expected) {
