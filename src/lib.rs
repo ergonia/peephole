@@ -17,6 +17,8 @@
 //! - [`account_iterator`]: Provides structures and methods for iterating over accounts.
 //! - [`assume`]: Contains macros for making performance-critical assumptions.
 //! - [`bytes`]: Offers utilities for efficient byte manipulation and conversion.
+//! - [`pubkey_byte_map`]: A map of pubkeys to their first byte for fast lookup.
+//! - [`solana_export`]: Re-exports of Solana's core types and functions.
 //! - [`utils`]: Includes utility functions like fast public key comparison.
 //!
 //! ## Safety
