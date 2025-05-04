@@ -472,8 +472,10 @@ impl<'a> NonDupAccount<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, fuzzing))]
+pub mod arbitrary_impls {
+
+    use solana_sdk::pubkey::Pubkey;
     use std::rc::Rc;
 
     use crate::bytes::PodUtils;
@@ -481,10 +483,9 @@ mod tests {
     use super::*;
     use quickcheck::Arbitrary;
     use solana_sdk::entrypoint;
-    use solana_sdk::pubkey::Pubkey;
 
     #[derive(Clone, Debug)]
-    enum TestAccount {
+    pub enum TestAccount {
         Real(NonDupAccountStatic, Vec<u8>),
         Duplicate(u8),
     }
@@ -518,7 +519,7 @@ mod tests {
         }
     }
 
-    fn create_test_account(
+    pub fn create_test_account(
         is_signer: bool,
         is_writable: bool,
         data: Vec<u8>,
@@ -537,7 +538,10 @@ mod tests {
         (account, data)
     }
 
-    fn create_test_instruction(accounts: Vec<TestAccount>, instruction_data: Vec<u8>) -> Vec<u8> {
+    pub fn create_test_instruction(
+        accounts: Vec<TestAccount>,
+        instruction_data: Vec<u8>,
+    ) -> Vec<u8> {
         let mut instruction = Vec::new();
         let num_accounts = accounts.len() as u64;
         instruction.extend_from_slice(&num_accounts.to_le_bytes());
@@ -570,6 +574,460 @@ mod tests {
 
         instruction
     }
+
+    // Typed account tests
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct AlignedStruct {
+        // 8-byte aligned
+        pub a: u64,
+        pub b: u64,
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct UnalignedStruct {
+        // Not 8-byte aligned
+        pub a: u16,
+        pub b: u8,
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct EmptyStruct {} // Zero-sized
+
+    pub fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts(data as *const _ as *const u8, std::mem::size_of::<T>())
+                .to_vec()
+        };
+
+        let (account, _) = create_test_account(true, true, data_bytes.clone());
+        create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![])
+    }
+    #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
+    #[repr(C)]
+    pub struct QuickCheckAligned {
+        pub a: u64,
+        pub b: u64,
+    }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[repr(C)]
+    pub struct QuickCheckUnaligned {
+        pub a: u16,
+        pub b: u8,
+    }
+
+    impl QuickCheckUnaligned {
+        fn create_vec(&self) -> Vec<u8> {
+            let rval = [&self.a.to_le_bytes()[..], &[self.b], &[0]].concat();
+
+            // tricky tricky.this is why we have pod enforcement everywhere
+            assert_eq!(rval.len(), std::mem::size_of::<QuickCheckUnaligned>());
+
+            rval
+        }
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[repr(C)]
+    pub struct QuickCheckEmpty {}
+
+    #[derive(Debug, Clone)]
+    pub enum TestAccountType {
+        Aligned(QuickCheckAligned, bool, bool),
+        Unaligned(QuickCheckUnaligned, bool, bool),
+        Empty(QuickCheckEmpty, bool, bool),
+        Untyped(Vec<u8>, bool, bool),
+        AlignedArray([(QuickCheckAligned, bool, bool); 2]),
+        AlignedArray3([(QuickCheckAligned, bool, bool); 3]),
+    }
+
+    impl Arbitrary for TestAccountType {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, bool, bool) {
+                (
+                    QuickCheckAligned {
+                        a: u64::arbitrary(g),
+                        b: u64::arbitrary(g),
+                    },
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                )
+            }
+            match u8::arbitrary(g) % 6 {
+                0 => TestAccountType::Aligned(
+                    QuickCheckAligned {
+                        a: u64::arbitrary(g),
+                        b: u64::arbitrary(g),
+                    },
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                ),
+                1 => TestAccountType::Unaligned(
+                    QuickCheckUnaligned {
+                        a: u16::arbitrary(g),
+                        b: u8::arbitrary(g),
+                    },
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                ),
+                2 => TestAccountType::Empty(
+                    QuickCheckEmpty {},
+                    bool::arbitrary(g),
+                    bool::arbitrary(g),
+                ),
+                3 => {
+                    let len = usize::arbitrary(g) % 32;
+                    let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
+                    TestAccountType::Untyped(data, bool::arbitrary(g), bool::arbitrary(g))
+                }
+                4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
+                _ => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
+            }
+        }
+    }
+
+    pub fn create_account_from_type(
+        account_type: TestAccountType,
+    ) -> Vec<(NonDupAccountStatic, Vec<u8>)> {
+        match account_type {
+            TestAccountType::Aligned(aligned, is_signer, is_writable) => {
+                let data = aligned.to_vec();
+                vec![create_test_account(is_signer, is_writable, data)]
+            }
+            TestAccountType::Unaligned(unaligned, is_signer, is_writable) => {
+                let data = unaligned.create_vec();
+                vec![create_test_account(is_signer, is_writable, data)]
+            }
+            TestAccountType::Empty(_, is_signer, is_writable) => {
+                vec![create_test_account(is_signer, is_writable, vec![])]
+            }
+            TestAccountType::Untyped(data, is_signer, is_writable) => {
+                vec![create_test_account(is_signer, is_writable, data.clone())]
+            }
+            TestAccountType::AlignedArray(array) => array
+                .iter()
+                .map(|(aligned, is_signer, is_writable)| {
+                    let data = aligned.to_vec();
+                    create_test_account(*is_signer, *is_writable, data)
+                })
+                .collect(),
+            TestAccountType::AlignedArray3(array) => array
+                .iter()
+                .map(|(aligned, is_signer, is_writable)| {
+                    let data = aligned.to_vec();
+                    create_test_account(*is_signer, *is_writable, data)
+                })
+                .collect(),
+        }
+    }
+
+    pub fn do_quickcheck_mixed_account_types_with_arrays(
+        account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
+    ) -> bool {
+        if account_types.is_empty() {
+            return true;
+        }
+
+        let accounts: Vec<_> = account_types
+            .iter()
+            .flat_map(|t| {
+                let accounts = create_account_from_type(t.clone());
+                accounts
+                    .into_iter()
+                    .map(|(acc, data)| TestAccount::Real(acc, data))
+            })
+            .collect();
+
+        let mut instruction = create_test_instruction(accounts, instruction_data_gen.clone());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        for account_type in account_types {
+            match account_type {
+                TestAccountType::Aligned(al, is_signer, is_writable) => {
+                    let (acc, next) =
+                        unsafe { iterator.static_slurp_typed_account::<QuickCheckAligned>() };
+                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckAligned>() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    if acc.data != al {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::Unaligned(un, is_signer, is_writable) => {
+                    let (acc, next) =
+                        unsafe { iterator.typed_known_next_full_account::<QuickCheckUnaligned>() };
+                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
+                    {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    let data_as_struct =
+                        unsafe { &*(acc.data().as_ptr() as *const QuickCheckUnaligned) };
+                    if data_as_struct != &un {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::Empty(_, is_signer, is_writable) => {
+                    let (acc, next) =
+                        unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
+                    if acc.static_data.data_len != 0 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::Untyped(data, is_signer, is_writable) => {
+                    let (acc, next) = unsafe { iterator.known_next_full_account() };
+                    if acc.data() != data.as_slice() {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != is_writable {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::AlignedArray(array) => {
+                    let (accs, next) =
+                        unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 2>() };
+                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
+                        if acc.static_data.data_len
+                            != std::mem::size_of::<QuickCheckAligned>() as u64
+                        {
+                            return false;
+                        }
+                        if (acc.static_data.is_signer == 1) != *is_signer {
+                            return false;
+                        }
+                        if (acc.static_data.is_writable == 1) != *is_writable {
+                            return false;
+                        }
+                        if &acc.data != given {
+                            return false;
+                        }
+                    }
+                    iterator = next;
+                }
+                TestAccountType::AlignedArray3(array) => {
+                    let (accs, next) =
+                        unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 3>() };
+                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
+                        if acc.static_data.data_len
+                            != std::mem::size_of::<QuickCheckAligned>() as u64
+                        {
+                            return false;
+                        }
+                        if (acc.static_data.is_signer == 1) != *is_signer {
+                            return false;
+                        }
+                        if (acc.static_data.is_writable == 1) != *is_writable {
+                            return false;
+                        }
+                        if &acc.data != given {
+                            return false;
+                        }
+                    }
+                    iterator = next;
+                }
+            }
+        }
+
+        // Verify we've reached the instruction data
+        let NextAccount::Data(check) = iterator.next() else {
+            return false;
+        };
+        check == instruction_data_gen.as_slice()
+    }
+
+    pub fn do_quickcheck_compare_with_solana_deserialize(
+        account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
+    ) -> bool {
+        // 1. Generate TestAccount structures from TestAccountType
+        let test_accounts: Vec<_> = account_types
+            .iter()
+            .flat_map(|t| {
+                let accounts = create_account_from_type(t.clone());
+                accounts
+                    .into_iter()
+                    .map(|(acc, data)| TestAccount::Real(acc, data))
+            })
+            .collect();
+
+        // 2. Create the instruction buffer
+        let mut instruction_buffer =
+            create_test_instruction(test_accounts.clone(), instruction_data_gen.clone());
+
+        // 3. Parse with AccountIterator
+        let mut fast_results = Vec::new();
+        let mut fast_iter =
+            unsafe { AccountIterator::new_from_instruction(instruction_buffer.as_mut_ptr()) };
+        let final_fast_data = loop {
+            match fast_iter.next() {
+                NextAccount::Account(acc, next_iter) => {
+                    fast_results.push(acc);
+                    fast_iter = next_iter;
+                }
+                NextAccount::Data(data) => {
+                    break data.to_vec(); // Clone data for comparison
+                }
+            }
+        };
+
+        // 4. Parse with solana_program::entrypoint::deserialize
+        let (_program_id_solana, accounts_solana, instruction_data_solana) =
+            unsafe { entrypoint::deserialize(instruction_buffer.as_mut_ptr()) };
+
+        // 5. Compare results
+
+        // Compare instruction data
+        if instruction_data_solana != final_fast_data.as_slice() {
+            eprintln!(
+                "Instruction data mismatch: Solana={:?}, Fast={:?}",
+                instruction_data_solana, final_fast_data
+            );
+            return false;
+        }
+
+        // Compare number of accounts
+        if fast_results.len() != accounts_solana.len() {
+            eprintln!(
+                "Account count mismatch: Solana={}, Fast={}",
+                accounts_solana.len(),
+                fast_results.len()
+            );
+            return false;
+        }
+
+        // Compare each account
+        for (i, (fast_acc, solana_acc)) in
+            fast_results.iter().zip(accounts_solana.iter()).enumerate()
+        {
+            match fast_acc {
+                AccountInInstruction::RealAccount(fast_real) => {
+                    // Check if Solana account is *not* a duplicate derived one.
+                    // Solana's deserialize clones AccountInfo for duplicates. We rely on Rc ptr equality
+                    // to differentiate original from cloned duplicates for this check.
+                    // If it's not the first account, check it wasn't cloned from a previous one.
+                    let is_solana_original = if i > 0 {
+                        let mut found_clone = false;
+                        for j in 0..i {
+                            if Rc::ptr_eq(&accounts_solana[j].lamports, &solana_acc.lamports)
+                                && Rc::ptr_eq(&accounts_solana[j].data, &solana_acc.data)
+                                && accounts_solana[j].key == solana_acc.key
+                            // Key comparison as extra safety
+                            {
+                                found_clone = true;
+                                break;
+                            }
+                        }
+                        !found_clone
+                    } else {
+                        true // First account is always original if present
+                    };
+
+                    if !is_solana_original {
+                        eprintln!(
+                            "Account type mismatch at index {}: Fast=Real, Solana=Duplicate",
+                            i
+                        );
+                        return false;
+                    }
+
+                    // Compare fields
+                    if fast_real.static_data.key != *solana_acc.key {
+                        eprintln!("Key mismatch at index {}", i);
+                        return false;
+                    }
+                    if (fast_real.static_data.is_signer != 0) != solana_acc.is_signer {
+                        eprintln!("is_signer mismatch at index {}", i);
+                        return false;
+                    }
+                    if (fast_real.static_data.is_writable != 0) != solana_acc.is_writable {
+                        eprintln!("is_writable mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.owner != *solana_acc.owner {
+                        eprintln!("Owner mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.lamports != **(solana_acc.lamports.borrow()) {
+                        eprintln!("Lamports mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.data_len != solana_acc.data.borrow().len() as u64 {
+                        eprintln!("Data length mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.data() != *solana_acc.data.borrow() {
+                        eprintln!("Data mismatch at index {}", i);
+                        return false;
+                    }
+                    if fast_real.static_data.executable != solana_acc.executable as u8 {
+                        eprintln!("Executable mismatch at index {}", i);
+                        return false;
+                    }
+                    if *fast_real.rent_epoch != solana_acc.rent_epoch {
+                        eprintln!("Rent epoch mismatch at index {}", i);
+                        return false;
+                    }
+                }
+                AccountInInstruction::Dup(fast_dup_index) => {
+                    // Check if Solana account *is* a duplicate by checking Rc ptr equality
+                    let original_solana_acc = &accounts_solana[*fast_dup_index];
+                    if !Rc::ptr_eq(&original_solana_acc.lamports, &solana_acc.lamports)
+                        || !Rc::ptr_eq(&original_solana_acc.data, &solana_acc.data)
+                        || original_solana_acc.key != solana_acc.key
+                    // Sanity check key too
+                    {
+                        eprintln!("Account type mismatch at index {}: Fast=Duplicate({}), Solana=Real or wrong duplicate", i, fast_dup_index);
+                        return false;
+                    }
+                    // No need to compare fields further, Rc::ptr_eq confirms it's a clone of the correct original
+                }
+            }
+        }
+
+        true // All checks passed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::bytes::PodUtils;
+
+    use super::*;
+    use quickcheck::Arbitrary;
+    use solana_sdk::entrypoint;
+
+    use super::arbitrary_impls::*;
 
     fn test_account_parsing(accounts: Vec<TestAccount>, instruction_data: Vec<u8>) {
         let mut instruction = create_test_instruction(accounts.clone(), instruction_data.clone());
@@ -954,37 +1412,6 @@ mod tests {
         assert_eq!(acc.static_data.data_len as usize, data.len());
     }
 
-    // Typed account tests
-    #[derive(Copy, Clone)]
-    #[repr(C)]
-    struct AlignedStruct {
-        // 8-byte aligned
-        a: u64,
-        b: u64,
-    }
-
-    #[derive(Copy, Clone)]
-    #[repr(C)]
-    struct UnalignedStruct {
-        // Not 8-byte aligned
-        a: u16,
-        b: u8,
-    }
-
-    #[derive(Copy, Clone)]
-    #[repr(C)]
-    struct EmptyStruct {} // Zero-sized
-
-    fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
-        let data_bytes = unsafe {
-            std::slice::from_raw_parts(data as *const _ as *const u8, std::mem::size_of::<T>())
-                .to_vec()
-        };
-
-        let (account, _) = create_test_account(true, true, data_bytes.clone());
-        create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![])
-    }
-
     #[test]
     fn test_typed_known_next_full_account_aligned() {
         let aligned_data = AlignedStruct { a: 1, b: 2 };
@@ -1022,264 +1449,12 @@ mod tests {
         assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
     }
 
-    #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
-    #[repr(C)]
-    struct QuickCheckAligned {
-        a: u64,
-        b: u64,
-    }
-
-    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    #[repr(C)]
-    struct QuickCheckUnaligned {
-        a: u16,
-        b: u8,
-    }
-
-    impl QuickCheckUnaligned {
-        fn create_vec(&self) -> Vec<u8> {
-            let rval = [&self.a.to_le_bytes()[..], &[self.b], &[0]].concat();
-
-            // tricky tricky.this is why we have pod enforcement everywhere
-            assert_eq!(rval.len(), std::mem::size_of::<QuickCheckUnaligned>());
-
-            rval
-        }
-    }
-
-    #[derive(Debug, Copy, Clone)]
-    #[repr(C)]
-    struct QuickCheckEmpty {}
-
-    #[derive(Debug, Clone)]
-    enum TestAccountType {
-        Aligned(QuickCheckAligned, bool, bool),
-        Unaligned(QuickCheckUnaligned, bool, bool),
-        Empty(QuickCheckEmpty, bool, bool),
-        Untyped(Vec<u8>, bool, bool),
-        AlignedArray([(QuickCheckAligned, bool, bool); 2]),
-        AlignedArray3([(QuickCheckAligned, bool, bool); 3]),
-    }
-
-    impl Arbitrary for TestAccountType {
-        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, bool, bool) {
-                (
-                    QuickCheckAligned {
-                        a: u64::arbitrary(g),
-                        b: u64::arbitrary(g),
-                    },
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
-                )
-            }
-            match u8::arbitrary(g) % 6 {
-                0 => TestAccountType::Aligned(
-                    QuickCheckAligned {
-                        a: u64::arbitrary(g),
-                        b: u64::arbitrary(g),
-                    },
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
-                ),
-                1 => TestAccountType::Unaligned(
-                    QuickCheckUnaligned {
-                        a: u16::arbitrary(g),
-                        b: u8::arbitrary(g),
-                    },
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
-                ),
-                2 => TestAccountType::Empty(
-                    QuickCheckEmpty {},
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
-                ),
-                3 => {
-                    let len = usize::arbitrary(g) % 32;
-                    let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
-                    TestAccountType::Untyped(data, bool::arbitrary(g), bool::arbitrary(g))
-                }
-                4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
-                _ => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
-            }
-        }
-    }
-
-    fn create_account_from_type(
-        account_type: TestAccountType,
-    ) -> Vec<(NonDupAccountStatic, Vec<u8>)> {
-        match account_type {
-            TestAccountType::Aligned(aligned, is_signer, is_writable) => {
-                let data = aligned.to_vec();
-                vec![create_test_account(is_signer, is_writable, data)]
-            }
-            TestAccountType::Unaligned(unaligned, is_signer, is_writable) => {
-                let data = unaligned.create_vec();
-                vec![create_test_account(is_signer, is_writable, data)]
-            }
-            TestAccountType::Empty(_, is_signer, is_writable) => {
-                vec![create_test_account(is_signer, is_writable, vec![])]
-            }
-            TestAccountType::Untyped(data, is_signer, is_writable) => {
-                vec![create_test_account(is_signer, is_writable, data.clone())]
-            }
-            TestAccountType::AlignedArray(array) => array
-                .iter()
-                .map(|(aligned, is_signer, is_writable)| {
-                    let data = aligned.to_vec();
-                    create_test_account(*is_signer, *is_writable, data)
-                })
-                .collect(),
-            TestAccountType::AlignedArray3(array) => array
-                .iter()
-                .map(|(aligned, is_signer, is_writable)| {
-                    let data = aligned.to_vec();
-                    create_test_account(*is_signer, *is_writable, data)
-                })
-                .collect(),
-        }
-    }
-
     #[quickcheck_macros::quickcheck]
-    fn quickcheck_mixed_account_types_with_arrays(account_types: Vec<TestAccountType>) -> bool {
-        do_quickcheck_mixed_account_types_with_arrays(account_types)
-    }
-
-    pub fn do_quickcheck_mixed_account_types_with_arrays(
+    fn quickcheck_mixed_account_types_with_arrays(
         account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
     ) -> bool {
-        if account_types.is_empty() {
-            return true;
-        }
-
-        let accounts: Vec<_> = account_types
-            .iter()
-            .flat_map(|t| {
-                let accounts = create_account_from_type(t.clone());
-                accounts
-                    .into_iter()
-                    .map(|(acc, data)| TestAccount::Real(acc, data))
-            })
-            .collect();
-
-        let mut instruction = create_test_instruction(accounts, vec![]);
-        let mut iterator =
-            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-
-        for account_type in account_types {
-            match account_type {
-                TestAccountType::Aligned(al, is_signer, is_writable) => {
-                    let (acc, next) =
-                        unsafe { iterator.static_slurp_typed_account::<QuickCheckAligned>() };
-                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckAligned>() as u64 {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != is_writable {
-                        return false;
-                    }
-                    if acc.data != al {
-                        return false;
-                    }
-                    iterator = next;
-                }
-                TestAccountType::Unaligned(un, is_signer, is_writable) => {
-                    let (acc, next) =
-                        unsafe { iterator.typed_known_next_full_account::<QuickCheckUnaligned>() };
-                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
-                    {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != is_writable {
-                        return false;
-                    }
-                    let data_as_struct =
-                        unsafe { &*(acc.data().as_ptr() as *const QuickCheckUnaligned) };
-                    if data_as_struct != &un {
-                        return false;
-                    }
-                    iterator = next;
-                }
-                TestAccountType::Empty(_, is_signer, is_writable) => {
-                    let (acc, next) =
-                        unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
-                    if acc.static_data.data_len != 0 {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != is_writable {
-                        return false;
-                    }
-                    iterator = next;
-                }
-                TestAccountType::Untyped(data, is_signer, is_writable) => {
-                    let (acc, next) = unsafe { iterator.known_next_full_account() };
-                    if acc.data() != data.as_slice() {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != is_writable {
-                        return false;
-                    }
-                    iterator = next;
-                }
-                TestAccountType::AlignedArray(array) => {
-                    let (accs, next) =
-                        unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 2>() };
-                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
-                        if acc.static_data.data_len
-                            != std::mem::size_of::<QuickCheckAligned>() as u64
-                        {
-                            return false;
-                        }
-                        if (acc.static_data.is_signer == 1) != *is_signer {
-                            return false;
-                        }
-                        if (acc.static_data.is_writable == 1) != *is_writable {
-                            return false;
-                        }
-                        if &acc.data != given {
-                            return false;
-                        }
-                    }
-                    iterator = next;
-                }
-                TestAccountType::AlignedArray3(array) => {
-                    let (accs, next) =
-                        unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 3>() };
-                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
-                        if acc.static_data.data_len
-                            != std::mem::size_of::<QuickCheckAligned>() as u64
-                        {
-                            return false;
-                        }
-                        if (acc.static_data.is_signer == 1) != *is_signer {
-                            return false;
-                        }
-                        if (acc.static_data.is_writable == 1) != *is_writable {
-                            return false;
-                        }
-                        if &acc.data != given {
-                            return false;
-                        }
-                    }
-                    iterator = next;
-                }
-            }
-        }
-
-        // Verify we've reached the instruction data
-        matches!(iterator.next(), NextAccount::Data(_))
+        do_quickcheck_mixed_account_types_with_arrays(account_types, instruction_data_gen)
     }
 
     #[quickcheck_macros::quickcheck]
@@ -1288,157 +1463,5 @@ mod tests {
         instruction_data_gen: Vec<u8>,
     ) -> bool {
         do_quickcheck_compare_with_solana_deserialize(account_types, instruction_data_gen)
-    }
-
-    pub fn do_quickcheck_compare_with_solana_deserialize(
-        account_types: Vec<TestAccountType>,
-        instruction_data_gen: Vec<u8>,
-    ) -> bool {
-        // 1. Generate TestAccount structures from TestAccountType
-        let test_accounts: Vec<_> = account_types
-            .iter()
-            .flat_map(|t| {
-                let accounts = create_account_from_type(t.clone());
-                accounts
-                    .into_iter()
-                    .map(|(acc, data)| TestAccount::Real(acc, data))
-            })
-            .collect();
-
-        // 2. Create the instruction buffer
-        let mut instruction_buffer =
-            create_test_instruction(test_accounts.clone(), instruction_data_gen.clone());
-
-        // 3. Parse with AccountIterator
-        let mut fast_results = Vec::new();
-        let mut fast_iter =
-            unsafe { AccountIterator::new_from_instruction(instruction_buffer.as_mut_ptr()) };
-        let final_fast_data = loop {
-            match fast_iter.next() {
-                NextAccount::Account(acc, next_iter) => {
-                    fast_results.push(acc);
-                    fast_iter = next_iter;
-                }
-                NextAccount::Data(data) => {
-                    break data.to_vec(); // Clone data for comparison
-                }
-            }
-        };
-
-        // 4. Parse with solana_program::entrypoint::deserialize
-        let (_program_id_solana, accounts_solana, instruction_data_solana) =
-            unsafe { entrypoint::deserialize(instruction_buffer.as_mut_ptr()) };
-
-        // 5. Compare results
-
-        // Compare instruction data
-        if instruction_data_solana != final_fast_data.as_slice() {
-            eprintln!(
-                "Instruction data mismatch: Solana={:?}, Fast={:?}",
-                instruction_data_solana, final_fast_data
-            );
-            return false;
-        }
-
-        // Compare number of accounts
-        if fast_results.len() != accounts_solana.len() {
-            eprintln!(
-                "Account count mismatch: Solana={}, Fast={}",
-                accounts_solana.len(),
-                fast_results.len()
-            );
-            return false;
-        }
-
-        // Compare each account
-        for (i, (fast_acc, solana_acc)) in
-            fast_results.iter().zip(accounts_solana.iter()).enumerate()
-        {
-            match fast_acc {
-                AccountInInstruction::RealAccount(fast_real) => {
-                    // Check if Solana account is *not* a duplicate derived one.
-                    // Solana's deserialize clones AccountInfo for duplicates. We rely on Rc ptr equality
-                    // to differentiate original from cloned duplicates for this check.
-                    // If it's not the first account, check it wasn't cloned from a previous one.
-                    let is_solana_original = if i > 0 {
-                        let mut found_clone = false;
-                        for j in 0..i {
-                            if Rc::ptr_eq(&accounts_solana[j].lamports, &solana_acc.lamports)
-                                && Rc::ptr_eq(&accounts_solana[j].data, &solana_acc.data)
-                                && accounts_solana[j].key == solana_acc.key
-                            // Key comparison as extra safety
-                            {
-                                found_clone = true;
-                                break;
-                            }
-                        }
-                        !found_clone
-                    } else {
-                        true // First account is always original if present
-                    };
-
-                    if !is_solana_original {
-                        eprintln!(
-                            "Account type mismatch at index {}: Fast=Real, Solana=Duplicate",
-                            i
-                        );
-                        return false;
-                    }
-
-                    // Compare fields
-                    if fast_real.static_data.key != *solana_acc.key {
-                        eprintln!("Key mismatch at index {}", i);
-                        return false;
-                    }
-                    if (fast_real.static_data.is_signer != 0) != solana_acc.is_signer {
-                        eprintln!("is_signer mismatch at index {}", i);
-                        return false;
-                    }
-                    if (fast_real.static_data.is_writable != 0) != solana_acc.is_writable {
-                        eprintln!("is_writable mismatch at index {}", i);
-                        return false;
-                    }
-                    if fast_real.static_data.owner != *solana_acc.owner {
-                        eprintln!("Owner mismatch at index {}", i);
-                        return false;
-                    }
-                    if fast_real.static_data.lamports != **(solana_acc.lamports.borrow()) {
-                        eprintln!("Lamports mismatch at index {}", i);
-                        return false;
-                    }
-                    if fast_real.static_data.data_len != solana_acc.data.borrow().len() as u64 {
-                        eprintln!("Data length mismatch at index {}", i);
-                        return false;
-                    }
-                    if fast_real.data() != *solana_acc.data.borrow() {
-                        eprintln!("Data mismatch at index {}", i);
-                        return false;
-                    }
-                    if fast_real.static_data.executable != solana_acc.executable as u8 {
-                        eprintln!("Executable mismatch at index {}", i);
-                        return false;
-                    }
-                    if *fast_real.rent_epoch != solana_acc.rent_epoch {
-                        eprintln!("Rent epoch mismatch at index {}", i);
-                        return false;
-                    }
-                }
-                AccountInInstruction::Dup(fast_dup_index) => {
-                    // Check if Solana account *is* a duplicate by checking Rc ptr equality
-                    let original_solana_acc = &accounts_solana[*fast_dup_index];
-                    if !Rc::ptr_eq(&original_solana_acc.lamports, &solana_acc.lamports)
-                        || !Rc::ptr_eq(&original_solana_acc.data, &solana_acc.data)
-                        || original_solana_acc.key != solana_acc.key
-                    // Sanity check key too
-                    {
-                        eprintln!("Account type mismatch at index {}: Fast=Duplicate({}), Solana=Real or wrong duplicate", i, fast_dup_index);
-                        return false;
-                    }
-                    // No need to compare fields further, Rc::ptr_eq confirms it's a clone of the correct original
-                }
-            }
-        }
-
-        true // All checks passed
     }
 }
