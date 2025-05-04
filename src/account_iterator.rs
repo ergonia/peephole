@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
+use crate::solana_export::pubkey::Pubkey;
 use bytemuck::{Pod, Zeroable};
-use solana_program::entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
-use solana_program::pubkey::Pubkey;
+use crate::solana_export::entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER};
 
 use crate::{assume, bytes::slurp};
 
@@ -478,7 +478,7 @@ pub mod arbitrary_impls {
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
 
-    use solana_program::pubkey::Pubkey;
+    use crate::solana_export::pubkey::Pubkey;
     use std::rc::Rc;
 
     use crate::bytes::PodUtils;
@@ -486,7 +486,7 @@ pub mod arbitrary_impls {
     use super::*;
     #[cfg(test)]
     use quickcheck::Arbitrary;
-    use solana_program::entrypoint;
+    use crate::solana_export::entrypoint;
 
     #[derive(Clone, Debug)]
     pub enum TestAccount {

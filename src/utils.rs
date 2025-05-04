@@ -1,4 +1,4 @@
-use solana_program::pubkey::Pubkey;
+use crate::solana_export::pubkey::Pubkey;
 
 /// Performs a fast comparison of two Solana public keys.
 ///
@@ -31,7 +31,7 @@ use solana_program::pubkey::Pubkey;
 /// # Example
 ///
 /// ```
-/// use solana_program::pubkey::Pubkey;
+/// use fast_instruction::solana_export::pubkey::Pubkey;
 /// use fast_instruction::utils::fast_cmp_pubkey;
 ///
 /// let pubkey1 = Pubkey::new_unique();

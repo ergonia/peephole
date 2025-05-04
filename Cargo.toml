@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-solana-program = { version = "=1.18", default-features = false, features = [] }
+solana-program = { version = "=1.18", optional = true }
+pinocchio = { version = "0.7", optional = true }
+
 bytemuck = { version = "1.18.0", features = ["derive"] }
 arbitrary = { version = "1", optional = true, features = ["derive"] }
 
@@ -13,4 +15,10 @@ quickcheck = "1.0.3"
 quickcheck_macros = "1.0.0"
 
 [features]
+default = ["solana-sdk"]
+# Feature to select Solana SDK
+solana-sdk = ["dep:solana-program"]
+# Feature to select Pinocchio SDK
+pinocchio-sdk = ["dep:pinocchio"]
+
 fuzzing = ["dep:arbitrary"]

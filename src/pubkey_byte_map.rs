@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use solana_program::pubkey::Pubkey;
+use crate::solana_export::pubkey::Pubkey;
 
 use crate::utils::fast_cmp_pubkey;
 
