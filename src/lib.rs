@@ -17,6 +17,8 @@
 //! - [`account_iterator`]: Provides structures and methods for iterating over accounts.
 //! - [`assume`]: Contains macros for making performance-critical assumptions.
 //! - [`bytes`]: Offers utilities for efficient byte manipulation and conversion.
+//! - [`pubkey_byte_map`]: A map of pubkeys to their first byte for fast lookup.
+//! - [`solana_export`]: Re-exports of Solana's core types and functions.
 //! - [`utils`]: Includes utility functions like fast public key comparison.
 //!
 //! ## Safety
@@ -24,13 +26,17 @@
 //! This library contains unsafe code and should be used with caution. It's designed
 //! for performance-critical scenarios in Solana smart contract development. Ensure
 //! you understand the implications of using these optimizations before incorporating
-//! them into your project.
+//! them into your project. Many of the unsafe acount parsing functions are only usable
+//! in permissioned code *after* the permissioning has been done in a safe way
 //!
 //! For more detailed information, refer to the documentation of individual modules
-//! and functions.
+//!
+
+#![allow(unexpected_cfgs)]
 
 pub mod account_iterator;
 pub mod assume;
 pub mod bytes;
 pub mod pubkey_byte_map;
+pub mod solana_export;
 pub mod utils;

@@ -15,7 +15,8 @@ arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.fast_instruction]
 path = ".."
-features = ["fuzzing"]
+features = ["fuzzing", "pinocchio-sdk"]
+default-features = false
 
 # Prevent this from interfering with workspaces
 [workspace]

@@ -1,5 +1,5 @@
+use crate::solana_export::{pubkey::Pubkey, pubkey_bytes, pubkey_from_array};
 use bytemuck::{Pod, Zeroable};
-use solana_sdk::pubkey::Pubkey;
 
 use crate::utils::fast_cmp_pubkey;
 
@@ -45,16 +45,16 @@ pub fn try_pubkey_byte_map(keys: &[Pubkey], key_map: &mut PubkeyMap) -> Result<(
     }
 
     let zero_bytes: [u8; 32] = [0; 32];
-    let zero = Pubkey::new_from_array(zero_bytes);
+    let zero = pubkey_from_array(zero_bytes);
 
     for k in &mut key_map.0 {
         *k = zero;
     }
 
     for (i, key) in keys.iter().enumerate() {
-        let key_bytes: [u8; 32] = key.to_bytes();
+        let key_bytes: [u8; 32] = pubkey_bytes(key);
         let first = key_bytes[0] as usize;
-        if bytes_equal(key_map.0[first].to_bytes(), zero_bytes) {
+        if bytes_equal(pubkey_bytes(&key_map.0[first]), zero_bytes) {
             key_map.0[first] = *key;
         } else {
             return Err(ERROR_MSGS[i]);
@@ -76,16 +76,16 @@ pub const fn pubkey_byte_map(keys: &[Pubkey]) -> PubkeyMap {
     }
 
     let zero_bytes: [u8; 32] = [0; 32];
-    let zero = Pubkey::new_from_array(zero_bytes);
+    let zero = pubkey_from_array(zero_bytes);
     let mut key_map = [zero; 256];
 
     let mut i = 0;
 
     while i < keys.len() {
         let key = keys[i];
-        let key_bytes: [u8; 32] = key.to_bytes();
+        let key_bytes: [u8; 32] = pubkey_bytes(&key);
         let first = key_bytes[0] as usize;
-        if bytes_equal(key_map[first].to_bytes(), zero_bytes) {
+        if bytes_equal(pubkey_bytes(&key_map[first]), zero_bytes) {
             key_map[first] = key;
         } else {
             panic!("{}", ERROR_MSGS[i]);
@@ -357,21 +357,23 @@ const ERROR_MSGS: [&str; 256] = [
 
 #[cfg(test)]
 mod tests {
+    use crate::solana_export::unique_pubkey;
+
     use super::*;
 
     #[test]
     fn test_contains() {
-        let key1 = Pubkey::new_from_array([
+        let key1 = pubkey_from_array([
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ]);
-        let key2 = Pubkey::new_from_array([
+        let key2 = pubkey_from_array([
             0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
             0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,
             0x2d, 0x2e, 0x2f, 0x30,
         ]);
-        let key3 = Pubkey::new_from_array([
+        let key3 = pubkey_from_array([
             0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
             0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
             0x3e, 0x3f, 0x40, 0x41,
@@ -388,26 +390,26 @@ mod tests {
     #[test]
     #[should_panic(expected = "keys length must be less than 256")]
     fn test_pubkey_byte_map_too_many_keys() {
-        let keys: Vec<_> = (0..300).map(|_| Pubkey::new_unique()).collect();
+        let keys: Vec<_> = (0..300).map(|_| unique_pubkey()).collect();
         let _ = pubkey_byte_map(&keys);
     }
 
     #[test]
     #[should_panic(expected = "Key 1 shares the same first byte as another key")]
     fn test_pubkey_byte_map_duplicate_first_bytes() {
-        let key1 = Pubkey::new_unique();
+        let key1 = unique_pubkey();
         let keys = &[key1, key1];
         let _ = pubkey_byte_map(keys);
     }
 
     #[test]
     fn test_pubkey_byte_map_non_matching_keys_with_same_first_byte() {
-        let key1 = Pubkey::new_from_array([
+        let key1 = pubkey_from_array([
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ]);
-        let key2 = Pubkey::new_from_array([
+        let key2 = pubkey_from_array([
             0x00, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3,
             0xf2, 0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5,
             0xe4, 0xe3, 0xe2, 0xe1,
@@ -422,17 +424,17 @@ mod tests {
 
     #[test]
     fn test_try_pubkey_byte_map() {
-        let key1 = Pubkey::new_from_array([
+        let key1 = pubkey_from_array([
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ]);
-        let key2 = Pubkey::new_from_array([
+        let key2 = pubkey_from_array([
             0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
             0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,
             0x2d, 0x2e, 0x2f, 0x30,
         ]);
-        let key3 = Pubkey::new_from_array([
+        let key3 = pubkey_from_array([
             0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
             0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
             0x3e, 0x3f, 0x40, 0x41,
@@ -449,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_try_pubkey_byte_map_too_many_keys() {
-        let keys: Vec<_> = (0..300).map(|_| Pubkey::new_unique()).collect();
+        let keys: Vec<_> = (0..300).map(|_| unique_pubkey()).collect();
         let mut map = PubkeyMap([Pubkey::default(); 256]);
         assert_eq!(
             try_pubkey_byte_map(&keys, &mut map),
@@ -459,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_try_pubkey_byte_map_duplicate_first_bytes() {
-        let key1 = Pubkey::new_unique();
+        let key1 = unique_pubkey();
         let keys = &[key1, key1];
         let mut map = PubkeyMap([Pubkey::default(); 256]);
         assert_eq!(
@@ -470,12 +472,12 @@ mod tests {
 
     #[test]
     fn test_try_pubkey_byte_map_non_matching_keys_with_same_first_byte() {
-        let key1 = Pubkey::new_from_array([
+        let key1 = pubkey_from_array([
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ]);
-        let key2 = Pubkey::new_from_array([
+        let key2 = pubkey_from_array([
             0x00, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3,
             0xf2, 0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5,
             0xe4, 0xe3, 0xe2, 0xe1,
