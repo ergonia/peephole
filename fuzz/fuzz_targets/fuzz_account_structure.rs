@@ -16,8 +16,8 @@ fuzz_target!(|data: AccountStructureInfo| {
         data.account_types.clone(),
         data.instruction_data_gen.clone()
     ));
-    // pinocchio parsing gets blown up by very trivial inputs, i suspect that
-    // it makes assumptions about data layout/generation that are only true for svm
-    // generated buffers? It repeatedly accesses one off the end of the buffer.
-    // Adding padding doesn't do anything?
+    assert!(do_quickcheck_compare_with_solana_deserialize(
+        data.account_types.clone(),
+        data.instruction_data_gen.clone()
+    ));
 });

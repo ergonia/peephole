@@ -622,6 +622,8 @@ pub mod arbitrary_impls {
         let instruction_len = instruction_data.len() as u64;
         instruction.extend_from_slice(&instruction_len.to_le_bytes());
         instruction.extend_from_slice(&instruction_data);
+        // add a program ID and some padding for alignment
+        instruction.extend_from_slice(&[0; 64]);
         instruction
     }
 
@@ -931,6 +933,9 @@ pub mod arbitrary_impls {
                     .into_iter()
                     .map(|(acc, data)| TestAccount::Real(acc, data))
             })
+            // We do this truncation to limit the number of accounts to 256
+            // to match pinochio entrypoint limit
+            .take(256)
             .collect();
 
         // 2. Create the instruction buffer
