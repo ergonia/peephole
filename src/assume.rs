@@ -12,7 +12,7 @@
 /// # Examples
 ///
 /// ```
-/// use fast_instruction::assume;
+/// use peephole::assume;
 /// let x = 42;
 /// unsafe {
 ///     assume!(x == 42, "x should always be 42");
@@ -46,7 +46,7 @@ macro_rules! assume {
 /// # Examples
 ///
 /// ```
-/// use fast_instruction::assume_matches;
+/// use peephole::assume_matches;
 /// enum MyEnum { Variant(i32) }
 /// let x = MyEnum::Variant(42);
 /// let result = unsafe {
@@ -83,7 +83,7 @@ macro_rules! assume_matches {
 /// # Examples
 ///
 /// ```
-/// use fast_instruction::assume_offset;
+/// use peephole::assume_offset;
 /// use std::ptr::NonNull;
 /// let array = [1, 2, 3, 4, 5];
 /// let ptr = NonNull::from(&array[0]);

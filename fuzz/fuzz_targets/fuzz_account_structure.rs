@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-use fast_instruction::account_iterator::arbitrary_impls::{
+use peephole::account_iterator::arbitrary_impls::{
     do_quickcheck_compare_with_solana_deserialize, do_quickcheck_mixed_account_types_with_arrays,
     TestAccountType,
 };

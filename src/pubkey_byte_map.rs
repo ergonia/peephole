@@ -16,7 +16,7 @@ const fn bytes_equal(a: [u8; 32], b: [u8; 32]) -> bool {
 }
 
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
+#[repr(align(8), C)]
 pub struct PubkeyMap(pub [Pubkey; 256]);
 
 impl PubkeyMap {

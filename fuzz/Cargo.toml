@@ -1,5 +1,5 @@
 [package]
-name = "fast_instruction-fuzz"
+name = "peephole-fuzz"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
@@ -13,7 +13,7 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
 
-[dependencies.fast_instruction]
+[dependencies.peephole]
 path = ".."
 features = ["fuzzing", "pinocchio-sdk"]
 default-features = false
