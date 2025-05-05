@@ -1,10 +1,17 @@
 [package]
 name = "fast_instruction"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Utilities for optimizing Solana smart contract development."
+repository = "https://github.com/ergonia/fast_instruction"
+readme = "README.md"
+keywords = ["solana", "performance", "optimization", "smart-contract"]
+categories = ["cryptography::blockchain", "development-tools"]
+authors = ["Ergonia"]
 
 [dependencies]
-solana-program = { version = "=1.18", optional = true }
+solana-program = { version = "1.18", optional = true, default-features = false }
 pinocchio = { version = "0.7", optional = true }
 
 bytemuck = { version = "1.18.0", features = ["derive"] }
