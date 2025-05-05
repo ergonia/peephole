@@ -56,7 +56,7 @@ mod solana {
     }
 
     #[cfg(any(test, fuzzing))]
-    impl<'a> IsAccount for account_info::AccountInfo<'a> {
+    impl IsAccount for account_info::AccountInfo<'_> {
         type Pubkey = pubkey::Pubkey;
         fn get_key(&self) -> &Self::Pubkey {
             self.key

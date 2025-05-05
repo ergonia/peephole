@@ -3,6 +3,7 @@
 
 # Cargo lock file (uncomment this line if you're building a library)
 Cargo.lock
+fuzz/Cargo.lock
 
 # IDE and editor files
 .vscode/

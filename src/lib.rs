@@ -1,6 +1,6 @@
-//! # Fast Instruction
+//! # Peephole
 //!
-//! `fast_instruction` is a Rust library designed to optimize and enhance the performance
+//! `peephole` is a Rust library designed to optimize and enhance the performance
 //! of Solana smart contract development. It provides a set of tools and utilities for
 //! efficient account and instruction handling, as well as optimized operations commonly
 //! used in Solana programs.
@@ -27,7 +27,7 @@
 //! for performance-critical scenarios in Solana smart contract development. Ensure
 //! you understand the implications of using these optimizations before incorporating
 //! them into your project. Many of the unsafe acount parsing functions are only usable
-//! in permissioned code *after* the permissioning has been done in a safe way
+//! in permissioned code *after* the permissioning has been done in a safe way.
 //!
 //! For more detailed information, refer to the documentation of individual modules
 //!

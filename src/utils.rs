@@ -31,8 +31,8 @@ use crate::solana_export::pubkey::Pubkey;
 /// # Example
 ///
 /// ```
-/// use fast_instruction::solana_export::pubkey::Pubkey;
-/// use fast_instruction::utils::fast_cmp_pubkey;
+/// use peephole::solana_export::pubkey::Pubkey;
+/// use peephole::utils::fast_cmp_pubkey;
 ///
 /// let pubkey1 = Pubkey::default();
 /// let pubkey2 = pubkey1;
