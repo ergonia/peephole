@@ -499,7 +499,7 @@ pub struct TypedNonDupAccount<T: Pod + Zeroable> {
 unsafe impl<T: Pod + Zeroable> Pod for TypedNonDupAccount<T> {}
 unsafe impl<T: Pod + Zeroable> Zeroable for TypedNonDupAccount<T> {}
 
-impl<'a> NonDupAccount<'a> {
+impl NonDupAccount<'_> {
     /// Returns an immutable slice of the account's data.
     #[inline]
     pub fn data(&self) -> &[u8] {
