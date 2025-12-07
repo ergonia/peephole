@@ -5,11 +5,14 @@
 //!
 //! Zero-copy account parsing for Solana programs.
 //!
-//! The standard `solana_program::entrypoint::deserialize` allocates `AccountInfo` structs
-//! and copies data into them. `peephole` skips that—you get typed pointers directly into
-//! the runtime's buffer, so reads and writes happen in-place.
+//! Standard deserialization allocates and copies. peephole gives you typed pointers
+//! directly into the runtime's buffer—reads and writes happen in-place.
 //!
-//! ## Basic Usage
+//! Real-world performance: [51 CU oracle update](https://solscan.io/tx/JkGJc3Q2eAjPKWG4PjbNxYguqc6gAqD96bMaAmqrotH2dn5cWXV7w8Sgp7tbckr1QKqab6749rhgPjTnQEDwDkB),
+//! [67 CUs for 3 oracle updates](https://solscan.io/tx/4w5T3BrUUb2zmcuVwZjNaiHY2ysfMeMNa5NE9bHfoywc8iPTJCfcFndZ2C9TyGQTj3jLMaVRALbRDDpWV9HAEHhU),
+//! [down to <20 CUs](https://solscan.io/tx/45Kzs3dkFQqq5BDB8qqp2F3QpBoeRLbzvnLBHZ6ZpL2EUJrBUzm4dcf4dquXt8dKvySHpHiPd5JMgKDmmKF3rn3r) for other production contracts.
+//!
+//! ## Iteration
 //!
 //! ```ignore
 //! use peephole::account_iterator::{AccountIterator, NextAccount, AccountInInstruction};
@@ -23,12 +26,10 @@
 //!             iter = next;
 //!         }
 //!         NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
-//!             // Duplicate of account at index `idx`
 //!             iter = next;
 //!         }
-//!         NextAccount::Data(instruction_data, program_iter) => {
-//!             // Access the program ID after instruction data
-//!             let program_id = program_iter.program_address();
+//!         NextAccount::Data(instruction_data, program_id) => {
+//!             // instruction_data: &mut [u8], program_id: &Pubkey
 //!             break;
 //!         }
 //!     }
@@ -37,30 +38,40 @@
 //!
 //! ## Typed Slurping
 //!
-//! Cast accounts directly to your struct (`T: Pod + Zeroable`, 8-byte aligned):
+//! When you know the account's data layout, cast directly to your struct:
 //!
 //! ```ignore
 //! let (account, iter) = unsafe { iter.static_slurp_typed_account::<TokenAccount>() };
-//! let amount = account.data.amount;  // direct field access
+//! account.data.amount += 100;
 //!
-//! // Batch slurp N accounts as an array
+//! // Batch slurp N accounts of the same type
 //! let (accounts, iter) = unsafe { iter.static_slurp_typed_accounts::<TokenAccount, 3>() };
 //! ```
 //!
 //! ## Safety
 //!
-//! The unsafe methods assume you know the account layout. Typical pattern: verify a
-//! trusted signer first, then use unsafe methods on the remaining accounts.
+//! Unsafe methods assume correct layout. Verify authority first, then trust the rest:
 //!
-//! Debug builds verify invariants. Release builds trust you.
+//! ```ignore
+//! let (authority, iter) = unsafe { iter.known_next_full_account() };
+//! if !(is_authority(&authority.static_data.key) && authority.static_data.is_signer()) {
+//!     return Err(Unauthorized);
+//! }
+//! // Authority verified—safe to trust remaining account types
+//! let (token, iter) = unsafe { iter.static_slurp_typed_account::<TokenAccount>() };
+//! ```
 //!
-//! ## Feature Flags
+//! Debug builds check invariants (account counts, no unexpected duplicates, size matches).
+//! Release builds trust you completely.
+//!
+//! ## Features
 //!
 //! `solana-sdk` or `pinocchio-sdk` (exactly one required).
 //!
 //! ## Modules
 //!
-//! - [`account_iterator`]: The core iterator and account types
+//! - [`account_iterator`]: Core iterator and account types ([`AccountIterator`](account_iterator::AccountIterator),
+//!   [`NonDupAccount`](account_iterator::NonDupAccount), [`TypedNonDupAccount`](account_iterator::TypedNonDupAccount))
 //! - [`assume`]: `debug_assert!` that becomes `unreachable_unchecked` in release
 //! - [`pubkey_byte_map`]: O(1) pubkey lookup (up to 256 keys, indexed by first byte)
 
