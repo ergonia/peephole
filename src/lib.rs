@@ -1,3 +1,6 @@
+#![no_std]
+#![allow(unexpected_cfgs)]
+
 //! # peephole
 //!
 //! Zero-copy account parsing for Solana programs.
@@ -60,9 +63,9 @@
 //! - [`account_iterator`]: The core iterator and account types
 //! - [`assume`]: `debug_assert!` that becomes `unreachable_unchecked` in release
 //! - [`pubkey_byte_map`]: O(1) pubkey lookup (up to 256 keys, indexed by first byte)
-//!
 
-#![allow(unexpected_cfgs)]
+#[cfg(any(test, feature = "std"))]
+extern crate std;
 
 pub mod account_iterator;
 pub mod assume;

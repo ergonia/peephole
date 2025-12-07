@@ -101,7 +101,7 @@
 //! Debug builds verify invariants (no dups where you expect real accounts, correct sizes).
 //! Release builds trust you completely.
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 use crate::solana_export::constants::MAX_PERMITTED_DATA_INCREASE;
 use crate::solana_export::constants::{BPF_ALIGN_OF_U128, NON_DUP_MARKER};
@@ -200,7 +200,7 @@ struct TypedSlurper<T>(PhantomData<T>);
 impl<T> Slurper for TypedSlurper<T> {
     #[inline]
     fn get_account_size(size_in_data: &u64) -> u64 {
-        let known_size = std::mem::size_of::<T>() as u64;
+        let known_size = core::mem::size_of::<T>() as u64;
         unsafe {
             assume!(known_size == *size_in_data, "Known size is not real size");
         }
@@ -209,7 +209,7 @@ impl<T> Slurper for TypedSlurper<T> {
 
     #[inline]
     fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
-        if std::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || std::mem::size_of::<T>() == 0 {
+        if core::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || core::mem::size_of::<T>() == 0 {
             ptr
         } else {
             unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
@@ -529,7 +529,7 @@ impl AccountIterator {
     unsafe fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
         let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
         let data_len = S::get_account_size(&account_static.data_len);
-        let data = std::slice::from_raw_parts_mut(next, data_len as usize);
+        let data = core::slice::from_raw_parts_mut(next, data_len as usize);
 
         let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
@@ -561,17 +561,17 @@ impl AccountIterator {
         // static assert libs good enough to make these guarantees at compile time?
         // will either compile to nothing or explode at runtime
         assert_eq!(
-            std::mem::size_of::<T>() % 8,
+            core::mem::size_of::<T>() % 8,
             0,
             "Account size must be a multiple of 8"
         );
         assert_eq!(
-            std::mem::size_of::<TypedNonDupAccount<T>>() % 8,
+            core::mem::size_of::<TypedNonDupAccount<T>>() % 8,
             0,
             "Account array size must be a multiple of 8"
         );
         assert_eq!(
-            std::mem::size_of::<[TypedNonDupAccount<T>; N]>() % 8,
+            core::mem::size_of::<[TypedNonDupAccount<T>; N]>() % 8,
             0,
             "Account array size must be a multiple of 8"
         );
@@ -588,10 +588,10 @@ impl AccountIterator {
                         copy_of_self = next_iter;
                         match acc {
                             AccountInInstruction::RealAccount(acc) => {
-                                if acc.static_data.data_len != std::mem::size_of::<T>() as u64 {
+                                if acc.static_data.data_len != core::mem::size_of::<T>() as u64 {
                                     panic!(
                                         "Expected account size of {} but got {}",
-                                        std::mem::size_of::<T>() as u64,
+                                        core::mem::size_of::<T>() as u64,
                                         acc.static_data.data_len
                                     );
                                 }
@@ -623,7 +623,7 @@ impl AccountIterator {
     fn slurp_instruction_data(self) -> (&'static mut [u8], ProgramAddressIterator) {
         let (instruction_length, instruction_data) = unsafe { slurp::<u64>(self.base_ptr) };
         let data =
-            unsafe { std::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize) };
+            unsafe { core::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize) };
         let program_id_ptr = unsafe { instruction_data.add(*instruction_length as usize) };
         (data, ProgramAddressIterator { ptr: program_id_ptr })
     }
@@ -736,6 +736,8 @@ impl NonDupAccount<'_> {
 
 #[cfg(any(test, fuzzing))]
 pub mod arbitrary_impls {
+    #[allow(unused_imports)]
+    use std::{eprintln, vec, vec::Vec, string::String, format};
 
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
@@ -1291,6 +1293,8 @@ pub mod arbitrary_impls {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use std::{eprintln, vec, vec::Vec, string::String, format};
 
     use super::*;
 

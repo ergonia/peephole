@@ -25,7 +25,7 @@ impl PubkeyMap {
     pub fn contains(&self, key: &Pubkey) -> bool {
         unsafe {
             // the as_ref and as_bytes calls are not inlined properly lol
-            let key_as_bytes: &[u8; 32] = std::mem::transmute(key);
+            let key_as_bytes: &[u8; 32] = core::mem::transmute(key);
             let first = *key_as_bytes.get_unchecked(0) as usize;
             // I don't trust compiler to elide bounds check
             fast_cmp_pubkey(key, self.0.get_unchecked(first))
@@ -357,6 +357,8 @@ const ERROR_MSGS: [&str; 256] = [
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use std::{vec, vec::Vec};
     use crate::solana_export::unique_pubkey;
 
     use super::*;
