@@ -6,7 +6,7 @@ compile_error!(
 #[cfg(not(any(feature = "solana-sdk", feature = "pinocchio-sdk")))]
 compile_error!("An SDK feature ('solana-sdk' or 'pinocchio-sdk') must be enabled.");
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, feature = "std"))]
 pub trait IsAccount {
     type Pubkey;
     fn get_key(&self) -> &Self::Pubkey;
@@ -29,7 +29,7 @@ mod solana {
         };
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, feature = "std"))]
     use super::IsAccount;
 
     #[inline]
@@ -42,20 +42,21 @@ mod solana {
         pubkey.to_bytes()
     }
 
+    #[cfg(any(test, feature = "std"))]
     pub fn unique_pubkey() -> pubkey::Pubkey {
         pubkey::Pubkey::new_unique()
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, feature = "std"))]
     pub fn easy_deserialize<'a>(
         inputs: *mut u8,
-    ) -> (pubkey::Pubkey, Vec<account_info::AccountInfo<'a>>, Vec<u8>) {
+    ) -> (pubkey::Pubkey, std::vec::Vec<account_info::AccountInfo<'a>>, std::vec::Vec<u8>) {
         let (program_id, accounts, instruction_data) = unsafe { entrypoint::deserialize(inputs) };
 
         (*program_id, accounts, instruction_data.to_vec())
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, feature = "std"))]
     impl IsAccount for account_info::AccountInfo<'_> {
         type Pubkey = pubkey::Pubkey;
         fn get_key(&self) -> &Self::Pubkey {
@@ -78,7 +79,7 @@ mod solana {
         }
         fn get_data(&self) -> &[u8] {
             let borrow = self.try_borrow_data().unwrap();
-            Vec::leak(borrow.to_vec())
+            std::vec::Vec::leak(borrow.to_vec())
         }
         fn get_executable(&self) -> bool {
             self.executable
@@ -88,7 +89,7 @@ mod solana {
 
 #[cfg(feature = "pinocchio-sdk")]
 mod solana {
-
+    #[cfg(any(test, feature = "std"))]
     use std::sync::atomic::{AtomicU64, Ordering};
 
     pub use pinocchio::*;
@@ -103,7 +104,7 @@ mod solana {
         pub const NON_DUP_MARKER: u8 = u8::MAX;
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, feature = "std"))]
     use super::IsAccount;
 
     #[inline]
@@ -116,8 +117,10 @@ mod solana {
         *pubkey
     }
 
+    #[cfg(any(test, feature = "std"))]
     static PUBKEY_CTR: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(any(test, feature = "std"))]
     pub fn unique_pubkey() -> pubkey::Pubkey {
         let ctr = PUBKEY_CTR.fetch_add(1, Ordering::Relaxed);
         let mut array = [0u8; 32];
@@ -126,13 +129,13 @@ mod solana {
         pubkey_from_array(array)
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, feature = "std"))]
     pub fn easy_deserialize(
         inputs: *mut u8,
-    ) -> (pubkey::Pubkey, Vec<account_info::AccountInfo>, Vec<u8>) {
+    ) -> (pubkey::Pubkey, std::vec::Vec<account_info::AccountInfo>, std::vec::Vec<u8>) {
         use std::mem::MaybeUninit;
 
-        let mut the_uninit = Vec::new();
+        let mut the_uninit = std::vec::Vec::new();
         for _ in 0..256 {
             the_uninit.push(MaybeUninit::uninit());
         }
@@ -147,7 +150,7 @@ mod solana {
         (*program_id, real_accounts, instruction_data.to_vec())
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, feature = "std"))]
     impl IsAccount for account_info::AccountInfo {
         type Pubkey = pubkey::Pubkey;
         fn get_key(&self) -> &Self::Pubkey {

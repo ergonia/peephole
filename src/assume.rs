@@ -28,7 +28,7 @@ macro_rules! assume {
         debug_assert!(_value, $rest);
 
         if !_value {
-            std::hint::unreachable_unchecked();
+            core::hint::unreachable_unchecked();
         }
     };
 }
@@ -63,7 +63,7 @@ macro_rules! assume_matches {
                 let msg = stringify!($expr => $pattern $(if $guard)?);
                 #[cfg(not(fuzzing))]
                 debug_assert!(false, "{}", msg);
-                std::hint::unreachable_unchecked()
+                core::hint::unreachable_unchecked()
             },
         }
     };
@@ -102,14 +102,13 @@ macro_rules! assume_offset {
             debug_assert_eq!(offset, $expected as isize, $rest);
         }
         if $ptr != $init.add($expected) {
-            std::hint::unreachable_unchecked();
+            core::hint::unreachable_unchecked();
         }
     };
 }
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn test_assume() {
         let x = 42;
