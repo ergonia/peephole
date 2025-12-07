@@ -1,3 +1,6 @@
+#![no_std]
+#![allow(unexpected_cfgs)]
+
 //! # peephole
 //!
 //! Zero-copy account parsing for Solana programs.
@@ -25,7 +28,11 @@
 //!         NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
 //!             iter = next;
 //!         }
-//!         NextAccount::Data(instruction_data) => break,
+//!         NextAccount::Data(instruction_data, program_iter) => {
+//!             // Access the program ID after instruction data
+//!             let program_id = program_iter.program_address();
+//!             break;
+//!         }
 //!     }
 //! }
 //! ```
@@ -67,10 +74,10 @@
 //! - [`account_iterator`]: Core iterator and account types ([`AccountIterator`](account_iterator::AccountIterator),
 //!   [`NonDupAccount`](account_iterator::NonDupAccount), [`TypedNonDupAccount`](account_iterator::TypedNonDupAccount))
 //! - [`assume`]: `debug_assert!` that becomes `unreachable_unchecked` in release
-//! - [`pubkey_byte_map`]: O(1) pubkey lookup by first byte for known key sets
-//!
+//! - [`pubkey_byte_map`]: O(1) pubkey lookup (up to 256 keys, indexed by first byte)
 
-#![allow(unexpected_cfgs)]
+#[cfg(any(test, feature = "std"))]
+extern crate std;
 
 pub mod account_iterator;
 pub mod assume;

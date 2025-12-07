@@ -44,8 +44,8 @@ pub fn fast_cmp_pubkey(a: &Pubkey, b: &Pubkey) -> bool {
     // tries to be cute and optimize for the case where we can exit early
     // at the cost of the full comparison. Not worth it really though
     unsafe {
-        let a: &[u64; 4] = std::mem::transmute(a);
-        let b: &[u64; 4] = std::mem::transmute(b);
+        let a: &[u64; 4] = core::mem::transmute(a);
+        let b: &[u64; 4] = core::mem::transmute(b);
 
         a == b
     }

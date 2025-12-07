@@ -1,4 +1,4 @@
-use std::mem::MaybeUninit;
+use core::mem::MaybeUninit;
 
 use bytemuck::Pod;
 
@@ -16,7 +16,7 @@ pub unsafe fn cast_ptr<T: Pod>(input: *mut u8) -> &'static mut T {
     let the_ref;
     #[cfg(debug_assertions)]
     {
-        let as_slice = std::slice::from_raw_parts_mut(input, std::mem::size_of::<T>());
+        let as_slice = core::slice::from_raw_parts_mut(input, core::mem::size_of::<T>());
         the_ref = bytemuck::from_bytes_mut(as_slice);
     }
     #[cfg(not(debug_assertions))]
@@ -40,7 +40,7 @@ pub unsafe fn cast_ptr_const<T: Pod>(input: *const u8) -> &'static T {
     let the_ref;
     #[cfg(debug_assertions)]
     {
-        let as_slice = std::slice::from_raw_parts(input, std::mem::size_of::<T>());
+        let as_slice = core::slice::from_raw_parts(input, core::mem::size_of::<T>());
         the_ref = bytemuck::from_bytes(as_slice);
     }
     #[cfg(not(debug_assertions))]
@@ -62,7 +62,7 @@ pub unsafe fn cast_ptr_const<T: Pod>(input: *const u8) -> &'static T {
 /// - The lifetime of the returned reference does not outlive the pointed-to data.
 #[inline(always)]
 pub unsafe fn slurp<T: Pod>(input: *mut u8) -> (&'static mut T, *mut u8) {
-    let next_ptr = input.add(std::mem::size_of::<T>());
+    let next_ptr = input.add(core::mem::size_of::<T>());
 
     (cast_ptr::<T>(input), next_ptr)
 }
@@ -79,7 +79,7 @@ pub unsafe fn slurp<T: Pod>(input: *mut u8) -> (&'static mut T, *mut u8) {
 /// - The lifetime of the returned reference does not outlive the pointed-to data.
 #[inline(always)]
 pub unsafe fn slurp_const<T: Pod>(input: *const u8) -> (&'static T, *const u8) {
-    let next_ptr = input.add(std::mem::size_of::<T>());
+    let next_ptr = input.add(core::mem::size_of::<T>());
 
     (cast_ptr_const::<T>(input), next_ptr)
 }
@@ -90,7 +90,9 @@ pub trait PodUtils: Pod {
     fn to_bytes(&self) -> &[u8];
 
     /// Converts the implementing type to a vector of bytes.
-    fn to_vec(&self) -> Vec<u8> {
+    /// Requires the `std` feature.
+    #[cfg(any(test, feature = "std"))]
+    fn to_vec(&self) -> std::vec::Vec<u8> {
         self.to_bytes().to_vec()
     }
 
@@ -127,16 +129,16 @@ impl<T: Pod> PodUtils for T {
 
     #[inline]
     fn try_from_slice(slice: &[u8]) -> Option<Self> {
-        if slice.len() != std::mem::size_of::<Self>() {
+        if slice.len() != core::mem::size_of::<Self>() {
             return None;
         }
 
         let mut uninit: MaybeUninit<T> = MaybeUninit::uninit();
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            core::ptr::copy_nonoverlapping(
                 slice.as_ptr(),
                 uninit.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<Self>(),
+                core::mem::size_of::<Self>(),
             );
             Some(uninit.assume_init())
         }
@@ -145,8 +147,8 @@ impl<T: Pod> PodUtils for T {
 
 #[inline(always)]
 pub const fn offset_after<T: Sized>(base: usize) -> usize {
-    let alignment_of_t = std::mem::align_of::<T>();
-    let size_of_t = std::mem::size_of::<T>();
+    let alignment_of_t = core::mem::align_of::<T>();
+    let size_of_t = core::mem::size_of::<T>();
 
     if base % alignment_of_t == 0 {
         base + size_of_t
@@ -157,7 +159,7 @@ pub const fn offset_after<T: Sized>(base: usize) -> usize {
 
 #[inline(always)]
 pub const fn validate_aligned<T: Sized>(base: usize) -> usize {
-    if base % std::mem::align_of::<T>() == 0 {
+    if base % core::mem::align_of::<T>() == 0 {
         base
     } else {
         panic!("Offset after is not aligned");
@@ -166,6 +168,8 @@ pub const fn validate_aligned<T: Sized>(base: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use std::{vec, vec::Vec};
     use bytemuck::Zeroable;
 
     use super::*;

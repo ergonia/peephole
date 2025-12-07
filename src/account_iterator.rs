@@ -24,6 +24,8 @@
 //! │ instruction_data_len: u64                   │
 //! ├─────────────────────────────────────────────┤
 //! │ instruction_data: [u8]                      │
+//! ├─────────────────────────────────────────────┤
+//! │ program_id: Pubkey (32 bytes)               │
 //! └─────────────────────────────────────────────┘
 //! ```
 //!
@@ -99,7 +101,7 @@
 //! Debug builds verify invariants (no dups where you expect real accounts, correct sizes).
 //! Release builds trust you completely.
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 use crate::solana_export::constants::MAX_PERMITTED_DATA_INCREASE;
 use crate::solana_export::constants::{BPF_ALIGN_OF_U128, NON_DUP_MARKER};
@@ -116,11 +118,32 @@ pub enum AccountInInstruction {
     Dup(usize),
 }
 
-/// Result of `AccountIterator::next()`.
+/// Iterator positioned at the program address (after instruction data has been consumed).
+///
+/// This is returned as part of `NextAccount::Data` to allow accessing the program ID
+/// that the Solana runtime places after instruction data in the serialized buffer.
+pub struct ProgramAddressIterator {
+    ptr: *mut u8,
+}
+
+impl ProgramAddressIterator {
+    /// Returns the program address (32-byte Pubkey).
+    ///
+    /// This is the program ID of the currently executing program, placed by the
+    /// Solana runtime after the instruction data.
+    #[inline]
+    pub fn program_address(self) -> &'static Pubkey {
+        unsafe { &*(self.ptr as *const Pubkey) }
+    }
+}
+
+/// Represents the result of advancing the `AccountIterator`.
+/// It can be either the next account in the sequence or the final instruction data.
 pub enum NextAccount {
-    /// All accounts consumed; this is your instruction data.
-    Data(&'static mut [u8]),
-    /// An account and the iterator positioned after it.
+    /// The instruction data slice and iterator to access the program address.
+    /// Returned after all accounts have been processed.
+    Data(&'static mut [u8], ProgramAddressIterator),
+    /// The next account encountered and the iterator advanced past it.
     Account(AccountInInstruction, AccountIterator),
 }
 
@@ -171,7 +194,7 @@ struct TypedSlurper<T>(PhantomData<T>);
 impl<T> Slurper for TypedSlurper<T> {
     #[inline]
     fn get_account_size(size_in_data: &u64) -> u64 {
-        let known_size = std::mem::size_of::<T>() as u64;
+        let known_size = core::mem::size_of::<T>() as u64;
         unsafe {
             assume!(known_size == *size_in_data, "Known size is not real size");
         }
@@ -180,7 +203,7 @@ impl<T> Slurper for TypedSlurper<T> {
 
     #[inline]
     fn get_next_pointer(ptr: *mut u8) -> *mut u8 {
-        if std::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || std::mem::size_of::<T>() == 0 {
+        if core::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || core::mem::size_of::<T>() == 0 {
             ptr
         } else {
             unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
@@ -230,12 +253,19 @@ impl AccountIterator {
         }
     }
 
-    /// Advances to the next account, or returns instruction data if all accounts consumed.
+    /// Advances the iterator and returns the next account or instruction data.
+    ///
+    /// # Returns
+    ///
+    /// A `NextAccount` enum containing either:
+    /// - `NextAccount::Account`: The next account and iterator to continue
+    /// - `NextAccount::Data`: The instruction data slice and a `ProgramAddressIterator`
+    ///   to access the program ID
     #[inline(always)]
     pub fn next(self) -> NextAccount {
         if self.remaining_accounts == 0 {
-            let slice = self.slurp_instruction_data();
-            NextAccount::Data(slice)
+            let (slice, program_iter) = self.slurp_instruction_data();
+            NextAccount::Data(slice, program_iter)
         } else {
             let is_dup = unsafe { *self.base_ptr };
             let (acc, next) = if is_dup == NON_DUP_MARKER {
@@ -380,14 +410,70 @@ impl AccountIterator {
             "known_instruction_data called with {} accounts remaining",
             self.remaining_accounts
         );
-        self.slurp_instruction_data()
+        let (data, _program_iter) = self.slurp_instruction_data();
+        data
+    }
+
+    /// Retrieves instruction data and program address together.
+    ///
+    /// This is a fast path for when you need both the instruction data and the program ID
+    /// without iterating through `NextAccount`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all accounts have been consumed (`remaining_accounts == 0`).
+    /// The iterator's internal pointer must be positioned at the instruction data length field.
+    ///
+    /// In debug builds, this is verified with an assertion.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the instruction data slice and a reference to the program address.
+    #[inline]
+    pub unsafe fn known_instruction_data_and_program_address(
+        self,
+    ) -> (&'static mut [u8], &'static Pubkey) {
+        debug_assert_eq!(
+            self.remaining_accounts, 0,
+            "known_instruction_data_and_program_address called with {} accounts remaining",
+            self.remaining_accounts
+        );
+        let (data, program_iter) = self.slurp_instruction_data();
+        (data, program_iter.program_address())
+    }
+
+    /// Retrieves only the program address, skipping instruction data.
+    ///
+    /// This is a fast path for when you only need the program ID and don't need
+    /// to read the instruction data.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all accounts have been consumed (`remaining_accounts == 0`).
+    /// The iterator's internal pointer must be positioned at the instruction data length field.
+    ///
+    /// In debug builds, this is verified with an assertion.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the program address (32-byte Pubkey).
+    #[inline]
+    pub unsafe fn known_program_address(self) -> &'static Pubkey {
+        debug_assert_eq!(
+            self.remaining_accounts, 0,
+            "known_program_address called with {} accounts remaining",
+            self.remaining_accounts
+        );
+        let (instruction_length, instruction_data) = slurp::<u64>(self.base_ptr);
+        let program_id_ptr = instruction_data.add(*instruction_length as usize);
+        &*(program_id_ptr as *const Pubkey)
     }
 
     #[inline]
     unsafe fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
         let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
         let data_len = S::get_account_size(&account_static.data_len);
-        let data = std::slice::from_raw_parts_mut(next, data_len as usize);
+        let data = core::slice::from_raw_parts_mut(next, data_len as usize);
 
         let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
@@ -419,17 +505,17 @@ impl AccountIterator {
         // static assert libs good enough to make these guarantees at compile time?
         // will either compile to nothing or explode at runtime
         assert_eq!(
-            std::mem::size_of::<T>() % 8,
+            core::mem::size_of::<T>() % 8,
             0,
             "Account size must be a multiple of 8"
         );
         assert_eq!(
-            std::mem::size_of::<TypedNonDupAccount<T>>() % 8,
+            core::mem::size_of::<TypedNonDupAccount<T>>() % 8,
             0,
             "Account array size must be a multiple of 8"
         );
         assert_eq!(
-            std::mem::size_of::<[TypedNonDupAccount<T>; N]>() % 8,
+            core::mem::size_of::<[TypedNonDupAccount<T>; N]>() % 8,
             0,
             "Account array size must be a multiple of 8"
         );
@@ -446,10 +532,10 @@ impl AccountIterator {
                         copy_of_self = next_iter;
                         match acc {
                             AccountInInstruction::RealAccount(acc) => {
-                                if acc.static_data.data_len != std::mem::size_of::<T>() as u64 {
+                                if acc.static_data.data_len != core::mem::size_of::<T>() as u64 {
                                     panic!(
                                         "Expected account size of {} but got {}",
-                                        std::mem::size_of::<T>() as u64,
+                                        core::mem::size_of::<T>() as u64,
                                         acc.static_data.data_len
                                     );
                                 }
@@ -459,7 +545,9 @@ impl AccountIterator {
                             }
                         }
                     }
-                    NextAccount::Data(_) => panic!("Expected an account, found instruction data"),
+                    NextAccount::Data(_, _) => {
+                        panic!("Expected an account, found instruction data")
+                    }
                 }
             }
 
@@ -469,10 +557,25 @@ impl AccountIterator {
         (data, next_bytes)
     }
 
+    /// Helper function to retrieve the instruction data and program address iterator.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the instruction data slice and a `ProgramAddressIterator`
+    /// positioned at the program ID that follows the instruction data.
     #[inline]
-    fn slurp_instruction_data(self) -> &'static mut [u8] {
+    fn slurp_instruction_data(self) -> (&'static mut [u8], ProgramAddressIterator) {
         let (instruction_length, instruction_data) = unsafe { slurp::<u64>(self.base_ptr) };
-        unsafe { std::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize) }
+        let data = unsafe {
+            core::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize)
+        };
+        let program_id_ptr = unsafe { instruction_data.add(*instruction_length as usize) };
+        (
+            data,
+            ProgramAddressIterator {
+                ptr: program_id_ptr,
+            },
+        )
     }
 
     /// Number of accounts left to iterate.
@@ -581,11 +684,13 @@ impl NonDupAccount<'_> {
 
 #[cfg(any(test, fuzzing))]
 pub mod arbitrary_impls {
+    #[allow(unused_imports)]
+    use std::{eprintln, format, string::String, vec, vec::Vec};
 
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
 
-    use crate::solana_export::{self, pubkey_from_array, unique_pubkey, IsAccount};
+    use crate::solana_export::{self, pubkey_bytes, pubkey_from_array, unique_pubkey, IsAccount};
 
     use crate::bytes::PodUtils;
 
@@ -649,9 +754,29 @@ pub mod arbitrary_impls {
         (account, data)
     }
 
+    /// Creates a test instruction buffer with the given accounts and instruction data.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (instruction_buffer, program_id) where program_id is the
+    /// unique pubkey placed at the end of the buffer.
     pub fn create_test_instruction(
         accounts: Vec<TestAccount>,
         instruction_data: Vec<u8>,
+    ) -> (Vec<u8>, Pubkey) {
+        let program_id = unique_pubkey();
+        let instruction =
+            create_test_instruction_with_program_id(accounts, instruction_data, program_id);
+        (instruction, program_id)
+    }
+
+    /// Creates a test instruction buffer with a specific program ID.
+    ///
+    /// Use this when you need to control the exact program ID in the buffer.
+    pub fn create_test_instruction_with_program_id(
+        accounts: Vec<TestAccount>,
+        instruction_data: Vec<u8>,
+        program_id: Pubkey,
     ) -> Vec<u8> {
         let mut instruction = Vec::new();
         let num_accounts = accounts.len() as u64;
@@ -682,8 +807,9 @@ pub mod arbitrary_impls {
         let instruction_len = instruction_data.len() as u64;
         instruction.extend_from_slice(&instruction_len.to_le_bytes());
         instruction.extend_from_slice(&instruction_data);
-        // add a program ID and some padding for alignment
-        instruction.extend_from_slice(&[0; 64]);
+        // add program ID (32 bytes) and padding for alignment (32 bytes)
+        instruction.extend_from_slice(&pubkey_bytes(&program_id));
+        instruction.extend_from_slice(&[0; 32]);
         instruction
     }
 
@@ -718,7 +844,9 @@ pub mod arbitrary_impls {
         };
 
         let (account, _) = create_test_account(true, true, data_bytes.clone());
-        create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![])
+        let (instruction, _program_id) =
+            create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![]);
+        instruction
     }
     #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
     #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
@@ -858,7 +986,8 @@ pub mod arbitrary_impls {
             })
             .collect();
 
-        let mut instruction = create_test_instruction(accounts, instruction_data_gen.clone());
+        let (mut instruction, _program_id) =
+            create_test_instruction(accounts, instruction_data_gen.clone());
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
@@ -974,7 +1103,7 @@ pub mod arbitrary_impls {
         }
 
         // Verify we've reached the instruction data
-        let NextAccount::Data(check) = iterator.next() else {
+        let NextAccount::Data(check, _program_iter) = iterator.next() else {
             return false;
         };
         check == instruction_data_gen.as_slice()
@@ -999,27 +1128,27 @@ pub mod arbitrary_impls {
             .collect();
 
         // 2. Create the instruction buffer
-        let mut instruction_buffer =
+        let (mut instruction_buffer, expected_program_id) =
             create_test_instruction(test_accounts.clone(), instruction_data_gen.clone());
 
         // 3. Parse with AccountIterator
         let mut fast_results = Vec::new();
         let mut fast_iter =
             unsafe { AccountIterator::new_from_instruction(instruction_buffer.as_mut_ptr()) };
-        let final_fast_data = loop {
+        let (final_fast_data, fast_program_id) = loop {
             match fast_iter.next() {
                 NextAccount::Account(acc, next_iter) => {
                     fast_results.push(acc);
                     fast_iter = next_iter;
                 }
-                NextAccount::Data(data) => {
-                    break data.to_vec(); // Clone data for comparison
+                NextAccount::Data(data, program_iter) => {
+                    break (data.to_vec(), *program_iter.program_address()); // Clone data for comparison
                 }
             }
         };
 
         // 4. Parse with solana_program::entrypoint::deserialize
-        let (_program_id_solana, accounts_solana, instruction_data_solana) =
+        let (program_id_solana, accounts_solana, instruction_data_solana) =
             solana_export::easy_deserialize(instruction_buffer.as_mut_ptr());
 
         // 5. Compare results
@@ -1089,19 +1218,40 @@ pub mod arbitrary_impls {
             }
         }
 
+        // Compare program IDs
+        if fast_program_id != program_id_solana {
+            eprintln!(
+                "Program ID mismatch: Solana={:?}, Fast={:?}",
+                program_id_solana, fast_program_id
+            );
+            return false;
+        }
+
+        // Verify our program ID matches the expected one we generated
+        if fast_program_id != expected_program_id {
+            eprintln!(
+                "Program ID doesn't match expected: Expected={:?}, Got={:?}",
+                expected_program_id, fast_program_id
+            );
+            return false;
+        }
+
         true // All checks passed
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use std::{eprintln, format, string::String, vec, vec::Vec};
 
     use super::*;
 
     use super::arbitrary_impls::*;
 
     fn test_account_parsing(accounts: Vec<TestAccount>, instruction_data: Vec<u8>) {
-        let mut instruction = create_test_instruction(accounts.clone(), instruction_data.clone());
+        let (mut instruction, _program_id) =
+            create_test_instruction(accounts.clone(), instruction_data.clone());
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
@@ -1131,13 +1281,15 @@ mod tests {
                     }
                     iterator = next_iter;
                 }
-                NextAccount::Data(_) => panic!("Expected an account, found instruction data"),
+                NextAccount::Data(_, _) => panic!("Expected an account, found instruction data"),
             }
         }
 
         // Check instruction data
         match iterator.next() {
-            NextAccount::Data(parsed_data) => assert_eq!(parsed_data, instruction_data.as_slice()),
+            NextAccount::Data(parsed_data, _) => {
+                assert_eq!(parsed_data, instruction_data.as_slice())
+            }
             _ => panic!("Expected instruction data"),
         }
     }
@@ -1190,12 +1342,13 @@ mod tests {
     #[test]
     fn test_no_accounts_only_instruction_data() {
         let instruction_data = vec![1, 2, 3, 4];
-        let mut instruction = create_test_instruction(vec![], instruction_data.clone());
+        let (mut instruction, _program_id) =
+            create_test_instruction(vec![], instruction_data.clone());
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         match iterator.next() {
-            NextAccount::Data(data) => assert_eq!(data, instruction_data.as_slice()),
+            NextAccount::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -1204,7 +1357,7 @@ mod tests {
     fn test_single_account_then_instruction_data() {
         let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
         let instruction_data = vec![5, 6, 7, 8];
-        let mut instruction = create_test_instruction(
+        let (mut instruction, _program_id) = create_test_instruction(
             vec![TestAccount::Real(account, data)],
             instruction_data.clone(),
         );
@@ -1218,7 +1371,7 @@ mod tests {
                 assert_eq!(acc.static_data.data_len, 4);
 
                 match next_iter.next() {
-                    NextAccount::Data(data) => assert_eq!(data, instruction_data.as_slice()),
+                    NextAccount::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
                     _ => panic!("Expected instruction data"),
                 }
             }
@@ -1231,7 +1384,7 @@ mod tests {
         let (account1, data1) = create_test_account(true, false, vec![1, 2, 3, 4]);
         let (account2, data2) = create_test_account(false, true, vec![5, 6, 7, 8, 9, 10]);
         let instruction_data = vec![11, 12];
-        let mut instruction = create_test_instruction(
+        let (mut instruction, _program_id) = create_test_instruction(
             vec![
                 TestAccount::Real(account1, data1),
                 TestAccount::Real(account2, data2),
@@ -1252,7 +1405,7 @@ mod tests {
         }
 
         match iterator.next() {
-            NextAccount::Data(data) => assert_eq!(data, instruction_data.as_slice()),
+            NextAccount::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -1260,7 +1413,7 @@ mod tests {
     #[test]
     fn test_dup_account() {
         let (account, data) = create_test_account(false, false, vec![1, 2, 3, 4]);
-        let mut instruction = create_test_instruction(
+        let (mut instruction, _program_id) = create_test_instruction(
             vec![TestAccount::Duplicate(0), TestAccount::Real(account, data)],
             vec![],
         );
@@ -1293,7 +1446,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut instruction = create_test_instruction(accounts, vec![]);
+        let (mut instruction, _program_id) = create_test_instruction(accounts, vec![]);
 
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -1310,12 +1463,13 @@ mod tests {
     #[test]
     fn test_instruction_length_reading() {
         let instruction_data = vec![1, 2, 3, 4, 5];
-        let mut instruction = create_test_instruction(vec![], instruction_data.clone());
+        let (mut instruction, _program_id) =
+            create_test_instruction(vec![], instruction_data.clone());
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         match iterator.next() {
-            NextAccount::Data(data) => assert_eq!(data.len(), instruction_data.len()),
+            NextAccount::Data(data, _) => assert_eq!(data.len(), instruction_data.len()),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -1324,7 +1478,7 @@ mod tests {
     fn test_account_data_offset() {
         let (account1, data1) = create_test_account(false, false, vec![1, 2, 3, 4]);
         let (account2, data2) = create_test_account(false, false, vec![5, 6, 7, 8, 9, 10]);
-        let mut instruction = create_test_instruction(
+        let (mut instruction, _program_id) = create_test_instruction(
             vec![
                 TestAccount::Real(account1, data1),
                 TestAccount::Real(account2, data2),
@@ -1357,7 +1511,7 @@ mod tests {
     fn test_account_data_verification() {
         let (account1, data1) = create_test_account(false, false, vec![1, 2, 3, 4]);
         let (account2, data2) = create_test_account(true, true, vec![5, 6, 7, 8, 9, 10]);
-        let mut instruction = create_test_instruction(
+        let (mut instruction, _program_id) = create_test_instruction(
             vec![
                 TestAccount::Real(account1, data1.clone()),
                 TestAccount::Real(account2, data2.clone()),
@@ -1389,7 +1543,7 @@ mod tests {
     #[test]
     fn test_known_next_full_account() {
         let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
-        let mut instruction =
+        let (mut instruction, _program_id) =
             create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -1419,7 +1573,7 @@ mod tests {
         };
 
         let (account, _) = create_test_account(true, true, data_bytes);
-        let mut instruction = create_test_instruction(
+        let (mut instruction, _program_id) = create_test_instruction(
             vec![TestAccount::Real(account, unsafe {
                 std::slice::from_raw_parts(
                     &test_data as *const _ as *const u8,
@@ -1445,7 +1599,7 @@ mod tests {
     fn test_known_next_full_account_aligned_size() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // size % 8 == 0
         let (account, _) = create_test_account(true, false, data.clone());
-        let mut instruction =
+        let (mut instruction, _program_id) =
             create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -1459,7 +1613,7 @@ mod tests {
     fn test_known_next_full_account_unaligned_size() {
         let data = vec![1, 2, 3, 4, 5]; // size % 8 != 0
         let (account, _) = create_test_account(true, false, data.clone());
-        let mut instruction =
+        let (mut instruction, _program_id) =
             create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -1473,7 +1627,7 @@ mod tests {
     fn test_known_next_full_account_zero_size() {
         let data = vec![]; // zero size
         let (account, _) = create_test_account(true, false, data.clone());
-        let mut instruction =
+        let (mut instruction, _program_id) =
             create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -1543,7 +1697,7 @@ mod tests {
         let (both_account, both_data) = create_test_account(true, true, vec![9, 10]);
         let (neither_account, neither_data) = create_test_account(false, false, vec![11, 12]);
 
-        let mut instruction = create_test_instruction(
+        let (mut instruction,_) = create_test_instruction(
             vec![
                 TestAccount::Real(signer_account, signer_data),
                 TestAccount::Real(writable_account, writable_data),
@@ -1571,5 +1725,324 @@ mod tests {
         let (acc, _) = unsafe { iter.known_next_full_account() };
         assert!(!acc.static_data.is_signer());
         assert!(!acc.static_data.is_writable());
+    }
+    // Program address tests
+    #[test]
+    fn test_program_address_retrieval() {
+        let instruction_data = vec![1, 2, 3, 4];
+        let (mut instruction, expected_program_id) =
+            create_test_instruction(vec![], instruction_data.clone());
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        match iterator.next() {
+            NextAccount::Data(data, program_iter) => {
+                assert_eq!(data, instruction_data.as_slice());
+                let program_id = program_iter.program_address();
+                assert_eq!(*program_id, expected_program_id);
+            }
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_program_address_with_accounts() {
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let instruction_data = vec![5, 6, 7, 8];
+        let (mut instruction, expected_program_id) = create_test_instruction(
+            vec![TestAccount::Real(account, data)],
+            instruction_data.clone(),
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        match iterator.next() {
+            NextAccount::Account(AccountInInstruction::RealAccount(_), next_iter) => {
+                match next_iter.next() {
+                    NextAccount::Data(data, program_iter) => {
+                        assert_eq!(data, instruction_data.as_slice());
+                        let program_id = program_iter.program_address();
+                        assert_eq!(*program_id, expected_program_id);
+                    }
+                    _ => panic!("Expected instruction data"),
+                }
+            }
+            _ => panic!("Expected a real account"),
+        }
+    }
+
+    #[test]
+    fn test_known_instruction_data_and_program_address() {
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let instruction_data = vec![5, 6, 7, 8];
+        let (mut instruction, expected_program_id) = create_test_instruction(
+            vec![TestAccount::Real(account, data)],
+            instruction_data.clone(),
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (_, iter) = unsafe { iterator.known_next_full_account() };
+        let (instr_data, program_id) = unsafe { iter.known_instruction_data_and_program_address() };
+
+        assert_eq!(instr_data, instruction_data.as_slice());
+        assert_eq!(*program_id, expected_program_id);
+    }
+
+    #[test]
+    fn test_known_program_address() {
+        let instruction_data = vec![1, 2, 3, 4];
+        let (mut instruction, expected_program_id) =
+            create_test_instruction(vec![], instruction_data.clone());
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let program_id = unsafe { iterator.known_program_address() };
+
+        assert_eq!(*program_id, expected_program_id);
+    }
+
+    #[test]
+    fn test_known_program_address_with_accounts() {
+        let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let (mut instruction, expected_program_id) =
+            create_test_instruction(vec![TestAccount::Real(account, data)], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (_, iter) = unsafe { iterator.known_next_full_account() };
+        let program_id = unsafe { iter.known_program_address() };
+
+        assert_eq!(*program_id, expected_program_id);
+    }
+
+    #[test]
+    fn test_program_address_with_empty_instruction_data() {
+        // Edge case: no instruction data, only program address
+        let (mut instruction, expected_program_id) = create_test_instruction(vec![], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        match iterator.next() {
+            NextAccount::Data(data, program_iter) => {
+                assert!(data.is_empty());
+                assert_eq!(*program_iter.program_address(), expected_program_id);
+            }
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_program_address_with_large_instruction_data() {
+        // Test with larger instruction data payload
+        let large_data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let (mut instruction, expected_program_id) =
+            create_test_instruction(vec![], large_data.clone());
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        match iterator.next() {
+            NextAccount::Data(data, program_iter) => {
+                assert_eq!(data.len(), 1024);
+                assert_eq!(data, large_data.as_slice());
+                assert_eq!(*program_iter.program_address(), expected_program_id);
+            }
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_program_address_consistency_between_methods() {
+        // Verify known_program_address and known_instruction_data_and_program_address
+        // return the same program ID
+        let instruction_data = vec![1, 2, 3, 4, 5];
+        let (mut instruction1, expected_program_id) =
+            create_test_instruction(vec![], instruction_data.clone());
+        let mut instruction2 = create_test_instruction_with_program_id(
+            vec![],
+            instruction_data.clone(),
+            expected_program_id,
+        );
+
+        let iter1 = unsafe { AccountIterator::new_from_instruction(instruction1.as_mut_ptr()) };
+        let iter2 = unsafe { AccountIterator::new_from_instruction(instruction2.as_mut_ptr()) };
+
+        let program_id1 = unsafe { iter1.known_program_address() };
+        let (_, program_id2) = unsafe { iter2.known_instruction_data_and_program_address() };
+
+        assert_eq!(*program_id1, *program_id2);
+        assert_eq!(*program_id1, expected_program_id);
+    }
+
+    #[test]
+    fn test_program_address_with_various_instruction_data_lengths() {
+        // Test alignment edge cases with different instruction data lengths
+        for len in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
+            let instruction_data: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let (mut instruction, expected_program_id) =
+                create_test_instruction(vec![], instruction_data.clone());
+
+            let iterator =
+                unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+            match iterator.next() {
+                NextAccount::Data(data, program_iter) => {
+                    assert_eq!(data.len(), len);
+                    assert_eq!(
+                        *program_iter.program_address(),
+                        expected_program_id,
+                        "Program address mismatch for instruction_data len={}",
+                        len
+                    );
+                }
+                _ => panic!("Expected instruction data for len={}", len),
+            }
+        }
+    }
+
+    #[test]
+    fn test_program_address_with_multiple_varied_accounts() {
+        // Multiple accounts with different data sizes, then verify program address
+        let (account1, data1) = create_test_account(true, false, vec![1; 8]); // aligned
+        let (account2, data2) = create_test_account(false, true, vec![2; 13]); // unaligned
+        let (account3, data3) = create_test_account(true, true, vec![]); // empty
+        let (account4, data4) = create_test_account(false, false, vec![4; 100]); // larger
+
+        let instruction_data = vec![0xAB, 0xCD, 0xEF];
+        let (mut instruction, expected_program_id) = create_test_instruction(
+            vec![
+                TestAccount::Real(account1, data1),
+                TestAccount::Real(account2, data2),
+                TestAccount::Real(account3, data3),
+                TestAccount::Real(account4, data4),
+            ],
+            instruction_data.clone(),
+        );
+
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Skip all 4 accounts
+        for _ in 0..4 {
+            match iterator.next() {
+                NextAccount::Account(_, next) => iterator = next,
+                _ => panic!("Expected an account"),
+            }
+        }
+
+        match iterator.next() {
+            NextAccount::Data(data, program_iter) => {
+                assert_eq!(data, instruction_data.as_slice());
+                assert_eq!(*program_iter.program_address(), expected_program_id);
+            }
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_program_address_with_duplicate_accounts() {
+        // Test with duplicate account markers
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let instruction_data = vec![5, 6, 7, 8];
+        let (mut instruction, expected_program_id) = create_test_instruction(
+            vec![
+                TestAccount::Real(account, data),
+                TestAccount::Duplicate(0),
+                TestAccount::Duplicate(0),
+            ],
+            instruction_data.clone(),
+        );
+
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Skip all 3 accounts (1 real + 2 dups)
+        for i in 0..3 {
+            match iterator.next() {
+                NextAccount::Account(acc, next) => {
+                    if i == 0 {
+                        assert!(matches!(acc, AccountInInstruction::RealAccount(_)));
+                    } else {
+                        assert!(matches!(acc, AccountInInstruction::Dup(0)));
+                    }
+                    iterator = next;
+                }
+                _ => panic!("Expected an account at index {}", i),
+            }
+        }
+
+        match iterator.next() {
+            NextAccount::Data(data, program_iter) => {
+                assert_eq!(data, instruction_data.as_slice());
+                assert_eq!(*program_iter.program_address(), expected_program_id);
+            }
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "known_program_address called with")]
+    fn test_known_program_address_panics_with_remaining_accounts() {
+        // Debug assertion: calling known_program_address before consuming all accounts should panic
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let (mut instruction, _expected_program_id) =
+            create_test_instruction(vec![TestAccount::Real(account, data)], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // This should panic because there's still 1 account remaining
+        let _ = unsafe { iterator.known_program_address() };
+    }
+
+    #[test]
+    #[should_panic(expected = "known_instruction_data_and_program_address called with")]
+    fn test_known_instruction_data_and_program_address_panics_with_remaining_accounts() {
+        // Debug assertion: calling known_instruction_data_and_program_address before consuming all accounts should panic
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let (mut instruction, _expected_program_id) =
+            create_test_instruction(vec![TestAccount::Real(account, data)], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // This should panic because there's still 1 account remaining
+        let _ = unsafe { iterator.known_instruction_data_and_program_address() };
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn quickcheck_program_address_always_valid(
+        account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
+    ) -> bool {
+        // Property: program address should always be retrievable and match expected
+        let accounts: Vec<_> = account_types
+            .iter()
+            .flat_map(|t| {
+                let accounts = create_account_from_type(t.clone());
+                accounts
+                    .into_iter()
+                    .map(|(acc, data)| TestAccount::Real(acc, data))
+            })
+            .take(256)
+            .collect();
+
+        let (mut instruction, expected_program_id) =
+            create_test_instruction(accounts, instruction_data_gen.clone());
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Iterate through all accounts
+        loop {
+            match iterator.next() {
+                NextAccount::Account(_, next) => iterator = next,
+                NextAccount::Data(data, program_iter) => {
+                    // Verify instruction data
+                    if data != instruction_data_gen.as_slice() {
+                        return false;
+                    }
+                    // Verify program address
+                    if *program_iter.program_address() != expected_program_id {
+                        return false;
+                    }
+                    return true;
+                }
+            }
+        }
     }
 }
