@@ -703,15 +703,25 @@ pub mod arbitrary_impls {
         is_writable: bool,
         data: Vec<u8>,
     ) -> (NonDupAccountStatic, Vec<u8>) {
+        create_test_account_full(is_signer, is_writable, false, 100, data)
+    }
+
+    pub fn create_test_account_full(
+        is_signer: bool,
+        is_writable: bool,
+        executable: bool,
+        lamports: u64,
+        data: Vec<u8>,
+    ) -> (NonDupAccountStatic, Vec<u8>) {
         let account = NonDupAccountStatic {
             is_dup: NON_DUP_MARKER,
             is_signer: is_signer as u8,
             is_writable: is_writable as u8,
-            executable: 0,
+            executable: executable as u8,
             original_data_len: data.len() as u32,
             key: unique_pubkey(),
             owner: unique_pubkey(),
-            lamports: 100,
+            lamports,
             data_len: data.len() as u64,
         };
         (account, data)
@@ -720,6 +730,14 @@ pub mod arbitrary_impls {
     pub fn create_test_instruction(
         accounts: Vec<TestAccount>,
         instruction_data: Vec<u8>,
+    ) -> Vec<u8> {
+        create_test_instruction_with_rent_epoch(accounts, instruction_data, 0)
+    }
+
+    pub fn create_test_instruction_with_rent_epoch(
+        accounts: Vec<TestAccount>,
+        instruction_data: Vec<u8>,
+        rent_epoch: u64,
     ) -> Vec<u8> {
         let mut instruction = Vec::new();
         let num_accounts = accounts.len() as u64;
@@ -739,7 +757,7 @@ pub mod arbitrary_impls {
 
                     assert_eq!(instruction.len() % BPF_ALIGN_OF_U128, 0);
 
-                    instruction.extend_from_slice(&0u64.to_le_bytes()); // rent_epoch
+                    instruction.extend_from_slice(&rent_epoch.to_le_bytes());
                 }
                 TestAccount::Duplicate(index) => {
                     instruction.extend_from_slice(&(index as u64).to_le_bytes());
@@ -1602,5 +1620,548 @@ mod tests {
         instruction_data_gen: Vec<u8>,
     ) -> bool {
         do_quickcheck_compare_with_solana_deserialize(account_types, instruction_data_gen)
+    }
+
+    // ==================== NEW TESTS ====================
+
+    #[test]
+    fn test_aligned_known_next_full_account() {
+        // Test with 8-byte aligned data (multiple of 8)
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 8 bytes - aligned
+        let (account, _) = create_test_account(true, false, data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![9, 10]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, next_iter) = unsafe { iterator.aligned_known_next_full_account() };
+
+        assert_eq!(acc.data(), data.as_slice());
+        assert_eq!(acc.static_data.is_signer, 1);
+        assert_eq!(acc.static_data.is_writable, 0);
+        assert_eq!(acc.static_data.data_len, 8);
+
+        // Verify we can continue to instruction data
+        match next_iter.next() {
+            NextAccount::Data(instr_data) => assert_eq!(instr_data, &[9, 10]),
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_aligned_known_next_full_account_multiple() {
+        // Test with multiple aligned accounts in sequence
+        let data1 = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 8 bytes
+        let data2 = vec![9, 10, 11, 12, 13, 14, 15, 16]; // 8 bytes
+        let (account1, _) = create_test_account(true, true, data1.clone());
+        let (account2, _) = create_test_account(false, true, data2.clone());
+        let mut instruction = create_test_instruction(
+            vec![
+                TestAccount::Real(account1, data1.clone()),
+                TestAccount::Real(account2, data2.clone()),
+            ],
+            vec![],
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc1, next_iter) = unsafe { iterator.aligned_known_next_full_account() };
+        assert_eq!(acc1.data(), data1.as_slice());
+
+        let (acc2, next_iter) = unsafe { next_iter.aligned_known_next_full_account() };
+        assert_eq!(acc2.data(), data2.as_slice());
+
+        match next_iter.next() {
+            NextAccount::Data(instr_data) => assert_eq!(instr_data, &[]),
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_known_instruction_data() {
+        let instruction_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let (account, data) = create_test_account(true, true, vec![10, 20, 30]);
+        let mut instruction = create_test_instruction(
+            vec![TestAccount::Real(account, data)],
+            instruction_data.clone(),
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Consume the account first
+        let (_, next_iter) = unsafe { iterator.known_next_full_account() };
+
+        // Now use known_instruction_data
+        let instr_data = unsafe { next_iter.known_instruction_data() };
+        assert_eq!(instr_data, instruction_data.as_slice());
+    }
+
+    #[test]
+    fn test_known_instruction_data_no_accounts() {
+        let instruction_data = vec![100, 200, 255, 0, 1];
+        let mut instruction = create_test_instruction(vec![], instruction_data.clone());
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // No accounts, so we can call known_instruction_data directly
+        let instr_data = unsafe { iterator.known_instruction_data() };
+        assert_eq!(instr_data, instruction_data.as_slice());
+    }
+
+    #[test]
+    fn test_rent_epoch_values() {
+        let rent_epoch_value = 12345678901234u64;
+        let data = vec![1, 2, 3, 4];
+        let (account, _) = create_test_account(true, false, data.clone());
+        let mut instruction = create_test_instruction_with_rent_epoch(
+            vec![TestAccount::Real(account, data)],
+            vec![],
+            rent_epoch_value,
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(*acc.rent_epoch, rent_epoch_value);
+    }
+
+    #[test]
+    fn test_rent_epoch_max_value() {
+        let rent_epoch_value = u64::MAX;
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let (account, _) = create_test_account(false, true, data.clone());
+        let mut instruction = create_test_instruction_with_rent_epoch(
+            vec![TestAccount::Real(account, data)],
+            vec![],
+            rent_epoch_value,
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(*acc.rent_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn test_remaining_accounts_accessor() {
+        let (account1, data1) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let (account2, data2) = create_test_account(false, true, vec![5, 6, 7, 8]);
+        let (account3, data3) = create_test_account(true, true, vec![9, 10]);
+        let mut instruction = create_test_instruction(
+            vec![
+                TestAccount::Real(account1, data1),
+                TestAccount::Real(account2, data2),
+                TestAccount::Real(account3, data3),
+            ],
+            vec![],
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        assert_eq!(iterator.remaining_accounts(), 3);
+
+        let (_, iter2) = unsafe { iterator.known_next_full_account() };
+        assert_eq!(iter2.remaining_accounts(), 2);
+
+        let (_, iter3) = unsafe { iter2.known_next_full_account() };
+        assert_eq!(iter3.remaining_accounts(), 1);
+
+        let (_, iter4) = unsafe { iter3.known_next_full_account() };
+        assert_eq!(iter4.remaining_accounts(), 0);
+    }
+
+    #[test]
+    fn test_base_ptr_accessor() {
+        let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data)], vec![5, 6]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let initial_ptr = iterator.base_ptr();
+
+        // The base_ptr should point somewhere within our instruction buffer
+        let buffer_start = instruction.as_ptr();
+        let buffer_end = unsafe { buffer_start.add(instruction.len()) };
+        assert!(initial_ptr as *const u8 >= buffer_start);
+        assert!((initial_ptr as *const u8) < buffer_end);
+
+        // After consuming an account, base_ptr should have advanced
+        let (_, next_iter) = unsafe { iterator.known_next_full_account() };
+        let next_ptr = next_iter.base_ptr();
+        assert!(next_ptr > initial_ptr);
+    }
+
+    #[test]
+    fn test_max_account_count_256() {
+        // Test with exactly 256 accounts (the maximum supported)
+        let accounts: Vec<TestAccount> = (0..256)
+            .map(|i| {
+                let (acc, data) = create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
+                TestAccount::Real(acc, data)
+            })
+            .collect();
+
+        let instruction_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut instruction = create_test_instruction(accounts, instruction_data.clone());
+
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let mut count = 0;
+
+        while iterator.remaining_accounts() > 0 {
+            let (acc, next_iter) = unsafe { iterator.known_next_full_account() };
+            assert_eq!(acc.data(), &[(count & 0xFF) as u8]);
+            iterator = next_iter;
+            count += 1;
+        }
+
+        assert_eq!(count, 256);
+
+        // Verify instruction data is still accessible
+        let instr_data = unsafe { iterator.known_instruction_data() };
+        assert_eq!(instr_data, instruction_data.as_slice());
+    }
+
+    #[test]
+    fn test_multiple_consecutive_dups() {
+        // Real account followed by 3 consecutive duplicates
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let mut instruction = create_test_instruction(
+            vec![
+                TestAccount::Real(account, data),
+                TestAccount::Duplicate(0),
+                TestAccount::Duplicate(0),
+                TestAccount::Duplicate(0),
+            ],
+            vec![99],
+        );
+
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // First should be real
+        match iterator.next() {
+            NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
+                assert_eq!(acc.data(), &[1, 2, 3, 4]);
+                iterator = next;
+            }
+            _ => panic!("Expected real account"),
+        }
+
+        // Next three should be dups pointing to index 0
+        for _ in 0..3 {
+            match iterator.next() {
+                NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+                    assert_eq!(idx, 0);
+                    iterator = next;
+                }
+                _ => panic!("Expected dup account"),
+            }
+        }
+
+        // Finally instruction data
+        match iterator.next() {
+            NextAccount::Data(instr_data) => assert_eq!(instr_data, &[99]),
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_dups_with_different_indices() {
+        // Multiple real accounts, then dups pointing to different indices
+        let (account0, data0) = create_test_account(true, false, vec![10]);
+        let (account1, data1) = create_test_account(false, true, vec![20]);
+        let (account2, data2) = create_test_account(true, true, vec![30]);
+
+        let mut instruction = create_test_instruction(
+            vec![
+                TestAccount::Real(account0, data0),
+                TestAccount::Real(account1, data1),
+                TestAccount::Real(account2, data2),
+                TestAccount::Duplicate(2), // dup of account2
+                TestAccount::Duplicate(0), // dup of account0
+                TestAccount::Duplicate(1), // dup of account1
+            ],
+            vec![],
+        );
+
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Skip past 3 real accounts
+        for expected_data in [10u8, 20u8, 30u8] {
+            match iterator.next() {
+                NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
+                    assert_eq!(acc.data(), &[expected_data]);
+                    iterator = next;
+                }
+                _ => panic!("Expected real account"),
+            }
+        }
+
+        // Verify dup indices
+        for expected_idx in [2usize, 0usize, 1usize] {
+            match iterator.next() {
+                NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+                    assert_eq!(idx, expected_idx);
+                    iterator = next;
+                }
+                _ => panic!("Expected dup account"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_executable_account() {
+        let data = vec![0xEF, 0xBE, 0xAD, 0xDE]; // Some "program" data
+        let (account, _) = create_test_account_full(false, false, true, 1000000, data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(acc.static_data.executable, 1);
+        assert_eq!(acc.static_data.is_signer, 0);
+        assert_eq!(acc.static_data.is_writable, 0);
+        assert_eq!(acc.static_data.lamports, 1000000);
+        assert_eq!(acc.data(), data.as_slice());
+    }
+
+    #[test]
+    fn test_lamports_values() {
+        let data = vec![1, 2, 3, 4];
+
+        // Test with various lamport values
+        for lamports in [0u64, 1, 100, 1_000_000_000, u64::MAX] {
+            let (account, _) = create_test_account_full(true, true, false, lamports, data.clone());
+            let mut instruction =
+                create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+
+            let iterator =
+                unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+            let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+            assert_eq!(acc.static_data.lamports, lamports);
+        }
+    }
+
+    #[test]
+    fn test_mutation_persistence() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let (account, _) = create_test_account(true, true, data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, data)], vec![]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.known_next_full_account() };
+
+        // Verify original data
+        assert_eq!(acc.all_data[0], 1);
+        assert_eq!(acc.all_data[3], 4);
+
+        // Mutate the data (all_data is &mut [u8], so we can mutate through it)
+        acc.all_data[0] = 100;
+        acc.all_data[3] = 200;
+
+        // Re-parse and verify mutation persisted
+        let iterator2 = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc2, _) = unsafe { iterator2.known_next_full_account() };
+
+        assert_eq!(acc2.all_data[0], 100);
+        assert_eq!(acc2.all_data[3], 200);
+    }
+
+    #[test]
+    fn test_typed_mutation_persistence() {
+        #[derive(Copy, Clone, Pod, Zeroable)]
+        #[repr(C)]
+        struct MutableData {
+            value_a: u64,
+            value_b: u64,
+        }
+
+        let initial = MutableData {
+            value_a: 111,
+            value_b: 222,
+        };
+        let mut instruction = create_typed_test_instruction(&initial);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.static_slurp_typed_account::<MutableData>() };
+
+        // Verify original values
+        assert_eq!(acc.data.value_a, 111);
+        assert_eq!(acc.data.value_b, 222);
+
+        // Mutate through the typed reference
+        acc.data.value_a = 999;
+        acc.data.value_b = 888;
+
+        // Re-parse and verify
+        let iterator2 = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc2, _) = unsafe { iterator2.static_slurp_typed_account::<MutableData>() };
+
+        assert_eq!(acc2.data.value_a, 999);
+        assert_eq!(acc2.data.value_b, 888);
+    }
+
+    #[test]
+    fn test_large_instruction_data() {
+        // Test with 10KB of instruction data
+        let instruction_data: Vec<u8> = (0..10240).map(|i| (i & 0xFF) as u8).collect();
+        let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let mut instruction = create_test_instruction(
+            vec![TestAccount::Real(account, data)],
+            instruction_data.clone(),
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (_, next_iter) = unsafe { iterator.known_next_full_account() };
+
+        let instr_data = unsafe { next_iter.known_instruction_data() };
+        assert_eq!(instr_data.len(), 10240);
+        assert_eq!(instr_data, instruction_data.as_slice());
+    }
+
+    #[test]
+    fn test_large_account_data() {
+        // Test with account data near MAX_PERMITTED_DATA_INCREASE size
+        let large_data: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
+        let (account, _) = create_test_account(true, true, large_data.clone());
+        let mut instruction =
+            create_test_instruction(vec![TestAccount::Real(account, large_data.clone())], vec![42]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, next_iter) = unsafe { iterator.known_next_full_account() };
+
+        assert_eq!(acc.data().len(), 1024);
+        assert_eq!(acc.data(), large_data.as_slice());
+        assert_eq!(acc.static_data.data_len, 1024);
+
+        // Verify we can still access instruction data
+        let instr_data = unsafe { next_iter.known_instruction_data() };
+        assert_eq!(instr_data, &[42]);
+    }
+
+    #[test]
+    fn test_static_slurp_typed_account_direct() {
+        // Direct unit test for static_slurp_typed_account (not just property test)
+        #[derive(Copy, Clone, Pod, Zeroable, PartialEq, Eq, Debug)]
+        #[repr(C)]
+        struct MyAccount {
+            field_a: u64,
+            field_b: u64,
+            field_c: u64,
+        }
+
+        let account_data = MyAccount {
+            field_a: 0xDEADBEEF,
+            field_b: 0xCAFEBABE,
+            field_c: 0x12345678,
+        };
+        let mut instruction = create_typed_test_instruction(&account_data);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (typed_acc, next_iter) = unsafe { iterator.static_slurp_typed_account::<MyAccount>() };
+
+        assert_eq!(typed_acc.data.field_a, 0xDEADBEEF);
+        assert_eq!(typed_acc.data.field_b, 0xCAFEBABE);
+        assert_eq!(typed_acc.data.field_c, 0x12345678);
+        assert_eq!(typed_acc.static_data.data_len, std::mem::size_of::<MyAccount>() as u64);
+
+        // Should be able to get instruction data after
+        assert_eq!(next_iter.remaining_accounts(), 0);
+    }
+
+    #[test]
+    fn test_static_slurp_typed_accounts_array() {
+        // Direct unit test for static_slurp_typed_accounts with array
+        #[derive(Copy, Clone, Pod, Zeroable, PartialEq, Eq, Debug)]
+        #[repr(C)]
+        struct SimpleAccount {
+            value: u64,
+        }
+
+        // Create 3 accounts with different values
+        let values = [100u64, 200u64, 300u64];
+        let accounts: Vec<TestAccount> = values
+            .iter()
+            .map(|&v| {
+                let data = SimpleAccount { value: v };
+                let data_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &data as *const _ as *const u8,
+                        std::mem::size_of::<SimpleAccount>(),
+                    )
+                    .to_vec()
+                };
+                let (acc, _) = create_test_account(true, true, data_bytes.clone());
+                TestAccount::Real(acc, data_bytes)
+            })
+            .collect();
+
+        let mut instruction = create_test_instruction(accounts, vec![42]);
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (typed_accs, next_iter) =
+            unsafe { iterator.static_slurp_typed_accounts::<SimpleAccount, 3>() };
+
+        assert_eq!(typed_accs[0].data.value, 100);
+        assert_eq!(typed_accs[1].data.value, 200);
+        assert_eq!(typed_accs[2].data.value, 300);
+
+        // Verify remaining state
+        assert_eq!(next_iter.remaining_accounts(), 0);
+        let instr_data = unsafe { next_iter.known_instruction_data() };
+        assert_eq!(instr_data, &[42]);
+    }
+
+    #[test]
+    fn test_mixed_typed_and_untyped_slurping() {
+        // Test real-world pattern: verify authority, then slurp typed accounts
+        #[derive(Copy, Clone, Pod, Zeroable)]
+        #[repr(C)]
+        struct TokenAccount {
+            balance: u64,
+            owner_index: u64,
+        }
+
+        // First account: authority (untyped, just need to check signer)
+        let (authority_acc, authority_data) = create_test_account(true, false, vec![0; 32]);
+
+        // Second account: typed token account
+        let token_data = TokenAccount {
+            balance: 1000000,
+            owner_index: 0,
+        };
+        let token_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &token_data as *const _ as *const u8,
+                std::mem::size_of::<TokenAccount>(),
+            )
+            .to_vec()
+        };
+        let (token_acc, _) = create_test_account(false, true, token_bytes.clone());
+
+        let mut instruction = create_test_instruction(
+            vec![
+                TestAccount::Real(authority_acc, authority_data),
+                TestAccount::Real(token_acc, token_bytes),
+            ],
+            vec![1, 2, 3], // instruction discriminator
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Step 1: Get authority account (untyped)
+        let (authority, next_iter) = unsafe { iterator.known_next_full_account() };
+        assert_eq!(authority.static_data.is_signer, 1);
+
+        // Step 2: Slurp typed token account
+        let (token, next_iter) = unsafe { next_iter.static_slurp_typed_account::<TokenAccount>() };
+        assert_eq!(token.data.balance, 1000000);
+        assert_eq!(token.static_data.is_writable, 1);
+
+        // Step 3: Get instruction data
+        let instr_data = unsafe { next_iter.known_instruction_data() };
+        assert_eq!(instr_data, &[1, 2, 3]);
     }
 }
