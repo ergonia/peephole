@@ -27,5 +27,7 @@ default = ["solana-sdk"]
 solana-sdk = ["dep:solana-program"]
 # Feature to select Pinocchio SDK
 pinocchio-sdk = ["dep:pinocchio"]
+# Enable std-dependent functionality (to_vec, etc.)
+std = []
 
-fuzzing = ["dep:arbitrary"]
+fuzzing = ["dep:arbitrary", "std"]
