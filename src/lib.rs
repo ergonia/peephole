@@ -1,35 +1,61 @@
-//! # Peephole
+//! # peephole
 //!
-//! `peephole` is a Rust library designed to optimize and enhance the performance
-//! of Solana smart contract development. It provides a set of tools and utilities for
-//! efficient account and instruction handling, as well as optimized operations commonly
-//! used in Solana programs.
+//! Zero-copy account parsing for Solana programs.
 //!
-//! ## Features
+//! The standard `solana_program::entrypoint::deserialize` allocates `AccountInfo` structs
+//! and copies data into them. `peephole` skips that—you get typed pointers directly into
+//! the runtime's buffer, so reads and writes happen in-place.
 //!
-//! - **Account Iterator**: Efficient iteration over accounts in Solana instructions.
-//! - **Assumption Macros**: Unsafe macros for performance-critical code sections.
-//! - **Byte Manipulation**: Fast and safe byte operations for Solana's data structures.
-//! - **Utility Functions**: Optimized functions for common Solana operations.
+//! ## Basic Usage
 //!
-//! ## Modules
+//! ```ignore
+//! use peephole::account_iterator::{AccountIterator, NextAccount, AccountInInstruction};
 //!
-//! - [`account_iterator`]: Provides structures and methods for iterating over accounts.
-//! - [`assume`]: Contains macros for making performance-critical assumptions.
-//! - [`bytes`]: Offers utilities for efficient byte manipulation and conversion.
-//! - [`pubkey_byte_map`]: A map of pubkeys to their first byte for fast lookup.
-//! - [`solana_export`]: Re-exports of Solana's core types and functions.
-//! - [`utils`]: Includes utility functions like fast public key comparison.
+//! let mut iter = unsafe { AccountIterator::new_from_instruction(input) };
+//! loop {
+//!     match iter.next() {
+//!         NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
+//!             let key = &acc.static_data.key;
+//!             let data = acc.data();
+//!             iter = next;
+//!         }
+//!         NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+//!             // Duplicate of account at index `idx`
+//!             iter = next;
+//!         }
+//!         NextAccount::Data(instruction_data) => break,
+//!     }
+//! }
+//! ```
+//!
+//! ## Typed Slurping
+//!
+//! Cast accounts directly to your struct (`T: Pod + Zeroable`, 8-byte aligned):
+//!
+//! ```ignore
+//! let (account, iter) = unsafe { iter.static_slurp_typed_account::<TokenAccount>() };
+//! let amount = account.data.amount;  // direct field access
+//!
+//! // Batch slurp N accounts as an array
+//! let (accounts, iter) = unsafe { iter.static_slurp_typed_accounts::<TokenAccount, 3>() };
+//! ```
 //!
 //! ## Safety
 //!
-//! This library contains unsafe code and should be used with caution. It's designed
-//! for performance-critical scenarios in Solana smart contract development. Ensure
-//! you understand the implications of using these optimizations before incorporating
-//! them into your project. Many of the unsafe acount parsing functions are only usable
-//! in permissioned code *after* the permissioning has been done in a safe way.
+//! The unsafe methods assume you know the account layout. Typical pattern: verify a
+//! trusted signer first, then use unsafe methods on the remaining accounts.
 //!
-//! For more detailed information, refer to the documentation of individual modules
+//! Debug builds verify invariants. Release builds trust you.
+//!
+//! ## Feature Flags
+//!
+//! `solana-sdk` or `pinocchio-sdk` (exactly one required).
+//!
+//! ## Modules
+//!
+//! - [`account_iterator`]: The core iterator and account types
+//! - [`assume`]: `debug_assert!` that becomes `unreachable_unchecked` in release
+//! - [`pubkey_byte_map`]: O(1) pubkey lookup (up to 256 keys, indexed by first byte)
 //!
 
 #![allow(unexpected_cfgs)]

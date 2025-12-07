@@ -1,3 +1,104 @@
+//! Zero-copy account iteration over Solana's serialized instruction buffer.
+//!
+//! # Why This Exists
+//!
+//! The Solana runtime passes all account data to your program as a single contiguous buffer.
+//! The standard `solana_program::entrypoint::deserialize` parses this buffer by allocating
+//! `AccountInfo` structs and copying data into them. This library skips that—it gives you
+//! typed views directly into the runtime's buffer, so reads and writes happen in-place.
+//!
+//! # Entrypoint Buffer Layout
+//!
+//! When your program is invoked, the runtime provides a buffer structured as:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────┐
+//! │ num_accounts: u64                           │
+//! ├─────────────────────────────────────────────┤
+//! │ Account 0                                   │
+//! ├─────────────────────────────────────────────┤
+//! │ Account 1                                   │
+//! ├─────────────────────────────────────────────┤
+//! │ ...                                         │
+//! ├─────────────────────────────────────────────┤
+//! │ instruction_data_len: u64                   │
+//! ├─────────────────────────────────────────────┤
+//! │ instruction_data: [u8]                      │
+//! └─────────────────────────────────────────────┘
+//! ```
+//!
+//! # Account Encoding
+//!
+//! Each account slot starts with a marker byte:
+//! - `0xFF` (NON_DUP_MARKER): A real account with full data follows
+//! - `0x00-0xFE`: A duplicate—the byte value is the index of the original account
+//!
+//! Duplicates occur when the same account appears multiple times in the instruction.
+//! The runtime only serializes the full data once; subsequent occurrences are just an index byte
+//! plus 7 bytes of padding.
+//!
+//! # Real Account Layout
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────┐
+//! │ NonDupAccountStatic (128 bytes)              │
+//! │   - is_dup: u8 (always 0xFF)                 │
+//! │   - is_signer: u8                            │
+//! │   - is_writable: u8                          │
+//! │   - executable: u8                           │
+//! │   - original_data_len: u32                   │
+//! │   - key: Pubkey (32 bytes)                   │
+//! │   - owner: Pubkey (32 bytes)                 │
+//! │   - lamports: u64                            │
+//! │   - data_len: u64                            │
+//! ├──────────────────────────────────────────────┤
+//! │ data: [u8; data_len]                         │
+//! ├──────────────────────────────────────────────┤
+//! │ growth_buffer: [u8; MAX_PERMITTED_DATA_INCREASE] │
+//! ├──────────────────────────────────────────────┤
+//! │ padding to 8-byte alignment                  │
+//! ├──────────────────────────────────────────────┤
+//! │ rent_epoch: u64                              │
+//! └──────────────────────────────────────────────┘
+//! ```
+//!
+//! The growth buffer (10KB) is reserved space that allows account data to grow during execution.
+//! The padding ensures the next account starts 8-byte aligned.
+//!
+//! # Typed Slurping
+//!
+//! `static_slurp_typed_account::<T>()` reinterprets the account bytes directly as your struct.
+//! No parsing, no copying—just a pointer cast. This is why `T` must be `Pod`: it guarantees
+//! the struct has no padding bytes that could contain uninitialized memory, and that any
+//! bit pattern is valid.
+//!
+//! The 8-byte alignment requirement exists because the runtime aligns accounts to 8 bytes.
+//! If your struct isn't a multiple of 8 bytes, the next account won't be where we expect it.
+//!
+//! # Safety Model
+//!
+//! The unsafe methods assume you know the account layout. If you slurp a `TokenAccount` but
+//! the actual data is a `MintAccount`, you get a valid pointer to garbage—field reads return
+//! wrong values, writes corrupt data.
+//!
+//! The typical pattern is: verify a trusted signer first, then use unsafe methods:
+//!
+//! ```ignore
+//! let mut iter = unsafe { AccountIterator::new_from_instruction(input) };
+//!
+//! // First account is always safe to read (can't be a dup, nothing to corrupt yet)
+//! let (authority, iter) = unsafe { iter.known_next_full_account() };
+//! if !is_authorized_signer(&authority.static_data.key) {
+//!     return Err(Unauthorized);
+//! }
+//!
+//! // Now we trust the transaction—safe to assume account types
+//! let (token_account, iter) = unsafe { iter.static_slurp_typed_account::<TokenAccount>() };
+//! ```
+//!
+//! Debug builds verify invariants (no dups where you expect real accounts, correct sizes).
+//! Release builds trust you completely.
+
 use std::marker::PhantomData;
 
 use crate::solana_export::constants::MAX_PERMITTED_DATA_INCREASE;
@@ -227,6 +328,12 @@ impl AccountIterator {
 
         let (account, next) = self.slurp_real_account::<Aligned>();
 
+        // Verify alignment assumption - compiler can use this hint to eliminate alignment code
+        assume!(
+            (next as usize) % BPF_ALIGN_OF_U128 == 0,
+            "aligned_known_next_full_account: next pointer not 8-byte aligned"
+        );
+
         (account, unsafe {
             AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
         })
@@ -263,18 +370,16 @@ impl AccountIterator {
         )
     }
 
-    /// Retrieves the next full (non-duplicate) account as a typed account.
+    /// Slurp one typed account. Returns a `TypedNonDupAccount<T>` pointing directly into
+    /// the runtime buffer—no allocation, no copy.
     ///
     /// # Safety
     ///
-    /// This function is unsafe because it assumes the next account is a full account
-    /// and that the account exactly holds one of the type passed with no extra allocated data.
+    /// - Next account must be real (not a dup marker)
+    /// - Account `data_len` must equal `size_of::<T>()`
+    /// - `T` must be `Pod + Zeroable` and 8-byte aligned
     ///
-    /// The caller must ensure that this assumption holds true.
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing the next full account and the updated iterator.
+    /// If violated: in debug builds you get a panic, in release you get UB.
     #[inline]
     pub unsafe fn static_slurp_typed_account<T: Pod + Zeroable>(
         self,
@@ -283,18 +388,15 @@ impl AccountIterator {
         (&mut single_account[0], next)
     }
 
-    /// Retrieves the next N full (non-duplicate) accounts as a typed array.
+    /// Slurp N typed accounts as an array. Single pointer cast for the whole batch.
     ///
     /// # Safety
     ///
-    /// This function is unsafe because it assumes the next N accounts are full accounts
-    /// and that each account exactly holds one of the type passed with no extra allocated data.
+    /// - All N accounts must be real (no dup markers)
+    /// - Each account's `data_len` must equal `size_of::<T>()`
+    /// - `T` must be `Pod + Zeroable` and 8-byte aligned
     ///
-    /// The caller must ensure that this assumption holds true.
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing the next N full accounts as an array and the updated iterator.
+    /// Debug builds walk all N accounts to verify. Release builds trust you.
     #[inline]
     pub unsafe fn static_slurp_typed_accounts<T: Pod + Zeroable, const N: usize>(
         self,
@@ -312,18 +414,28 @@ impl AccountIterator {
         })
     }
 
-    /// Retrieves the instruction data.
+    /// Retrieves the instruction data, skipping the normal iteration.
+    ///
+    /// Use this when you've already processed all accounts and want direct access to
+    /// the instruction data without going through `NextAccount::Data`.
     ///
     /// # Safety
     ///
-    /// This function is unsafe because it assumes the iterator is at the instruction data.
-    /// The caller must ensure that all accounts have been processed before calling this.
+    /// The caller must ensure all accounts have been consumed (`remaining_accounts == 0`).
+    /// The iterator's internal pointer must be positioned at the instruction data length field.
+    ///
+    /// In debug builds, this is verified with an assertion.
     ///
     /// # Returns
     ///
-    /// A slice containing the instruction data.
+    /// A mutable slice containing the instruction data.
     #[inline]
     pub unsafe fn known_instruction_data(self) -> &'static mut [u8] {
+        debug_assert_eq!(
+            self.remaining_accounts, 0,
+            "known_instruction_data called with {} accounts remaining",
+            self.remaining_accounts
+        );
         self.slurp_instruction_data()
     }
 
@@ -365,15 +477,22 @@ impl AccountIterator {
             "Too few accounts left for array slurp"
         );
 
+        // static assert libs good enough to make these guarantees at compile time?
+        // will either compile to nothing or explode at runtime
         assert_eq!(
             std::mem::size_of::<T>() % 8,
             0,
             "Account size must be a multiple of 8"
         );
         assert_eq!(
+            std::mem::size_of::<TypedNonDupAccount<T>>() % 8,
+            0,
+            "Account array size must be a multiple of 8"
+        );
+        assert_eq!(
             std::mem::size_of::<[TypedNonDupAccount<T>; N]>() % 8,
             0,
-            "Account size must be less than 8 bytes"
+            "Account array size must be a multiple of 8"
         );
 
         let (data, next_bytes) = slurp::<[TypedNonDupAccount<T>; N]>(self.base_ptr);
@@ -480,17 +599,26 @@ pub struct NonDupAccount<'a> {
     pub rent_epoch: &'a u64,
 }
 
-/// Represents a non-duplicate account where the data section is statically typed.
-/// This struct is designed for direct memory mapping (`Pod`, `Zeroable`) when using
-/// `static_slurp_typed_account` or `static_slurp_typed_accounts`.
+/// Typed account for direct memory mapping. Layout matches the runtime's serialization exactly.
+///
+/// ```text
+/// [NonDupAccountStatic: 128 bytes]
+/// [data: T]
+/// [_buffer: 10KB growth reserve]
+/// [rent_epoch: u64]
+/// ```
+///
+/// The `_buffer` exists because Solana reserves 10KB after each account for potential
+/// reallocation during execution.
 #[derive(PartialEq, Eq, Copy, Clone)]
 #[repr(C)]
 pub struct TypedNonDupAccount<T: Pod + Zeroable> {
-    /// The static metadata part of the account.
+    /// The static metadata: is_signer, is_writable, key, owner, lamports, data_len, etc.
     pub static_data: NonDupAccountStatic,
-    /// The account's data, interpreted as type `T`.
+    /// The account's data, interpreted as type `T`. Mutations here write directly to the
+    /// runtime buffer and persist after the instruction completes.
     pub data: T,
-    /// Buffer space reserved by the runtime for potential data resizing.
+    /// Reserved buffer space for potential data growth. Do not access directly.
     _buffer: [u8; MAX_PERMITTED_DATA_INCREASE],
     /// The rent epoch associated with the account.
     pub rent_epoch: u64,
