@@ -663,7 +663,8 @@ pub mod arbitrary_impls {
 
     #[derive(Clone, Debug)]
     pub enum TestAccount {
-        Real(NonDupAccountStatic, Vec<u8>),
+        /// A real account with static data, account data, and rent_epoch
+        Real(NonDupAccountStatic, Vec<u8>, u64),
         Duplicate(u8),
     }
 
@@ -686,14 +687,15 @@ pub mod arbitrary_impls {
                     is_dup: NON_DUP_MARKER,
                     is_signer: bool::arbitrary(g) as u8,
                     is_writable: bool::arbitrary(g) as u8,
-                    executable: 0,
+                    executable: bool::arbitrary(g) as u8,
                     original_data_len: data.len() as u32,
                     key: pubkey_from_array(arbitrary_array(g)),
                     owner: pubkey_from_array(arbitrary_array(g)),
-                    lamports: 100,
+                    lamports: u64::arbitrary(g),
                     data_len: data.len() as u64,
                 };
-                TestAccount::Real(static_data, data)
+                let rent_epoch = u64::arbitrary(g);
+                TestAccount::Real(static_data, data, rent_epoch)
             }
         }
     }
@@ -727,17 +729,23 @@ pub mod arbitrary_impls {
         (account, data)
     }
 
+    /// Create a test account from metadata - includes all fuzzable fields
+    pub fn create_test_account_with_meta(
+        meta: &TestAccountMeta,
+        data: Vec<u8>,
+    ) -> (NonDupAccountStatic, Vec<u8>) {
+        create_test_account_full(
+            meta.is_signer,
+            meta.is_writable,
+            meta.executable,
+            meta.lamports,
+            data,
+        )
+    }
+
     pub fn create_test_instruction(
         accounts: Vec<TestAccount>,
         instruction_data: Vec<u8>,
-    ) -> Vec<u8> {
-        create_test_instruction_with_rent_epoch(accounts, instruction_data, 0)
-    }
-
-    pub fn create_test_instruction_with_rent_epoch(
-        accounts: Vec<TestAccount>,
-        instruction_data: Vec<u8>,
-        rent_epoch: u64,
     ) -> Vec<u8> {
         let mut instruction = Vec::new();
         let num_accounts = accounts.len() as u64;
@@ -745,7 +753,7 @@ pub mod arbitrary_impls {
 
         for account in accounts {
             match account {
-                TestAccount::Real(acc, data) => {
+                TestAccount::Real(acc, data, rent_epoch) => {
                     instruction.extend_from_slice(acc.to_bytes());
                     instruction.extend_from_slice(&data);
                     instruction.extend_from_slice(&vec![0; MAX_PERMITTED_DATA_INCREASE]);
@@ -771,6 +779,25 @@ pub mod arbitrary_impls {
         // add a program ID and some padding for alignment
         instruction.extend_from_slice(&[0; 64]);
         instruction
+    }
+
+    /// Legacy helper for tests that don't need per-account rent_epoch
+    pub fn create_test_instruction_with_rent_epoch(
+        accounts: Vec<TestAccount>,
+        instruction_data: Vec<u8>,
+        rent_epoch: u64,
+    ) -> Vec<u8> {
+        // Convert old-style accounts to new format with uniform rent_epoch
+        let accounts_with_rent: Vec<_> = accounts
+            .into_iter()
+            .map(|acc| match acc {
+                TestAccount::Real(static_data, data, _) => {
+                    TestAccount::Real(static_data, data, rent_epoch)
+                }
+                TestAccount::Duplicate(idx) => TestAccount::Duplicate(idx),
+            })
+            .collect();
+        create_test_instruction(accounts_with_rent, instruction_data)
     }
 
     // Typed account tests
@@ -804,7 +831,7 @@ pub mod arbitrary_impls {
         };
 
         let (account, _) = create_test_account(true, true, data_bytes.clone());
-        create_test_instruction(vec![TestAccount::Real(account, data_bytes)], vec![])
+        create_test_instruction(vec![TestAccount::Real(account, data_bytes, 0)], vec![])
     }
     #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
     #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
@@ -838,15 +865,52 @@ pub mod arbitrary_impls {
     #[repr(C)]
     pub struct QuickCheckEmpty {}
 
+    /// Metadata for a test account - all the fuzzable properties
+    #[derive(Debug, Clone, Copy)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
+    pub struct TestAccountMeta {
+        pub is_signer: bool,
+        pub is_writable: bool,
+        pub executable: bool,
+        pub lamports: u64,
+        pub rent_epoch: u64,
+    }
+
+    impl TestAccountMeta {
+        /// Create a simple test meta with default values
+        pub fn simple(is_signer: bool, is_writable: bool) -> Self {
+            Self {
+                is_signer,
+                is_writable,
+                executable: false,
+                lamports: 100,
+                rent_epoch: 0,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for TestAccountMeta {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self {
+                is_signer: bool::arbitrary(g),
+                is_writable: bool::arbitrary(g),
+                executable: bool::arbitrary(g),
+                lamports: u64::arbitrary(g),
+                rent_epoch: u64::arbitrary(g),
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     pub enum TestAccountType {
-        Aligned(QuickCheckAligned, bool, bool),
-        Unaligned(QuickCheckUnaligned, bool, bool),
-        Empty(QuickCheckEmpty, bool, bool),
-        Untyped(Vec<u8>, bool, bool),
-        AlignedArray([(QuickCheckAligned, bool, bool); 2]),
-        AlignedArray3([(QuickCheckAligned, bool, bool); 3]),
+        Aligned(QuickCheckAligned, TestAccountMeta),
+        Unaligned(QuickCheckUnaligned, TestAccountMeta),
+        Empty(QuickCheckEmpty, TestAccountMeta),
+        Untyped(Vec<u8>, TestAccountMeta),
+        AlignedArray([(QuickCheckAligned, TestAccountMeta); 2]),
+        AlignedArray3([(QuickCheckAligned, TestAccountMeta); 3]),
         /// Duplicate of a previous account. The u8 is a hint that will be
         /// taken modulo the number of real accounts seen so far.
         Duplicate(u8),
@@ -855,14 +919,13 @@ pub mod arbitrary_impls {
     #[cfg(test)]
     impl Arbitrary for TestAccountType {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, bool, bool) {
+            fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, TestAccountMeta) {
                 (
                     QuickCheckAligned {
                         a: u64::arbitrary(g),
                         b: u64::arbitrary(g),
                     },
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
                 )
             }
             match u8::arbitrary(g) % 8 {
@@ -871,26 +934,30 @@ pub mod arbitrary_impls {
                         a: u64::arbitrary(g),
                         b: u64::arbitrary(g),
                     },
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
                 ),
                 1 => TestAccountType::Unaligned(
                     QuickCheckUnaligned {
                         a: u16::arbitrary(g),
                         b: u8::arbitrary(g),
                     },
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
                 ),
                 2 => TestAccountType::Empty(
                     QuickCheckEmpty {},
-                    bool::arbitrary(g),
-                    bool::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
                 ),
                 3 => {
-                    let len = usize::arbitrary(g) % 32;
+                    // Generate data with sizes that test alignment edge cases
+                    let alignment_edge_sizes = [0, 1, 7, 8, 9, 15, 16, 17, 31, 32];
+                    let len = if bool::arbitrary(g) {
+                        // 50% chance of alignment edge case size
+                        alignment_edge_sizes[usize::arbitrary(g) % alignment_edge_sizes.len()]
+                    } else {
+                        usize::arbitrary(g) % 64
+                    };
                     let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
-                    TestAccountType::Untyped(data, bool::arbitrary(g), bool::arbitrary(g))
+                    TestAccountType::Untyped(data, TestAccountMeta::arbitrary(g))
                 }
                 4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
                 5 => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
@@ -900,36 +967,43 @@ pub mod arbitrary_impls {
         }
     }
 
+    /// Creates test accounts from a TestAccountType, returning (static_data, data, rent_epoch) tuples
     pub fn create_account_from_type(
         account_type: TestAccountType,
-    ) -> Vec<(NonDupAccountStatic, Vec<u8>)> {
+    ) -> Vec<(NonDupAccountStatic, Vec<u8>, u64)> {
         match account_type {
-            TestAccountType::Aligned(aligned, is_signer, is_writable) => {
+            TestAccountType::Aligned(aligned, meta) => {
                 let data = aligned.to_vec();
-                vec![create_test_account(is_signer, is_writable, data)]
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
             }
-            TestAccountType::Unaligned(unaligned, is_signer, is_writable) => {
+            TestAccountType::Unaligned(unaligned, meta) => {
                 let data = unaligned.create_vec();
-                vec![create_test_account(is_signer, is_writable, data)]
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
             }
-            TestAccountType::Empty(_, is_signer, is_writable) => {
-                vec![create_test_account(is_signer, is_writable, vec![])]
+            TestAccountType::Empty(_, meta) => {
+                let (acc, data) = create_test_account_with_meta(&meta, vec![]);
+                vec![(acc, data, meta.rent_epoch)]
             }
-            TestAccountType::Untyped(data, is_signer, is_writable) => {
-                vec![create_test_account(is_signer, is_writable, data.clone())]
+            TestAccountType::Untyped(data, meta) => {
+                let (acc, data) = create_test_account_with_meta(&meta, data.clone());
+                vec![(acc, data, meta.rent_epoch)]
             }
             TestAccountType::AlignedArray(array) => array
                 .iter()
-                .map(|(aligned, is_signer, is_writable)| {
+                .map(|(aligned, meta)| {
                     let data = aligned.to_vec();
-                    create_test_account(*is_signer, *is_writable, data)
+                    let (acc, data) = create_test_account_with_meta(meta, data);
+                    (acc, data, meta.rent_epoch)
                 })
                 .collect(),
             TestAccountType::AlignedArray3(array) => array
                 .iter()
-                .map(|(aligned, is_signer, is_writable)| {
+                .map(|(aligned, meta)| {
                     let data = aligned.to_vec();
-                    create_test_account(*is_signer, *is_writable, data)
+                    let (acc, data) = create_test_account_with_meta(meta, data);
+                    (acc, data, meta.rent_epoch)
                 })
                 .collect(),
             // Duplicates are handled separately in create_test_accounts_from_types
@@ -940,6 +1014,9 @@ pub mod arbitrary_impls {
     /// Converts a list of TestAccountType into a flat list of TestAccount,
     /// properly handling duplicates by computing valid indices based on
     /// how many real accounts have been seen so far.
+    ///
+    /// Note: The first account can never be a duplicate (invalid in Solana).
+    /// Duplicate hints are taken modulo the number of real accounts seen so far.
     pub fn create_test_accounts_from_types(account_types: &[TestAccountType]) -> Vec<TestAccount> {
         let mut result = Vec::new();
         let mut real_account_count = 0usize;
@@ -947,7 +1024,8 @@ pub mod arbitrary_impls {
         for account_type in account_types {
             match account_type {
                 TestAccountType::Duplicate(hint) => {
-                    // Only create a dup if there's at least one real account to reference
+                    // Only create a dup if there's at least one real account to reference.
+                    // This naturally prevents the first account from being a duplicate.
                     if real_account_count > 0 {
                         let dup_index = (*hint as usize) % real_account_count;
                         result.push(TestAccount::Duplicate(dup_index as u8));
@@ -956,8 +1034,8 @@ pub mod arbitrary_impls {
                 }
                 other => {
                     let real_accounts = create_account_from_type(other.clone());
-                    for (acc, data) in real_accounts {
-                        result.push(TestAccount::Real(acc, data));
+                    for (acc, data, rent_epoch) in real_accounts {
+                        result.push(TestAccount::Real(acc, data, rent_epoch));
                         real_account_count += 1;
                     }
                 }
@@ -984,7 +1062,7 @@ pub mod arbitrary_impls {
                 let accounts = create_account_from_type(t.clone());
                 accounts
                     .into_iter()
-                    .map(|(acc, data)| TestAccount::Real(acc, data))
+                    .map(|(acc, data, rent_epoch)| TestAccount::Real(acc, data, rent_epoch))
             })
             .collect();
 
@@ -994,16 +1072,25 @@ pub mod arbitrary_impls {
 
         for account_type in account_types {
             match account_type {
-                TestAccountType::Aligned(al, is_signer, is_writable) => {
+                TestAccountType::Aligned(al, meta) => {
                     let (acc, next) =
                         unsafe { iterator.static_slurp_typed_account::<QuickCheckAligned>() };
                     if acc.static_data.data_len != std::mem::size_of::<QuickCheckAligned>() as u64 {
                         return false;
                     }
-                    if (acc.static_data.is_signer == 1) != is_signer {
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
                         return false;
                     }
-                    if (acc.static_data.is_writable == 1) != is_writable {
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if acc.rent_epoch != meta.rent_epoch {
                         return false;
                     }
                     if acc.data != al {
@@ -1011,17 +1098,26 @@ pub mod arbitrary_impls {
                     }
                     iterator = next;
                 }
-                TestAccountType::Unaligned(un, is_signer, is_writable) => {
+                TestAccountType::Unaligned(un, meta) => {
                     let (acc, next) =
                         unsafe { iterator.typed_known_next_full_account::<QuickCheckUnaligned>() };
                     if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
                     {
                         return false;
                     }
-                    if (acc.static_data.is_signer == 1) != is_signer {
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
                         return false;
                     }
-                    if (acc.static_data.is_writable == 1) != is_writable {
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
                         return false;
                     }
                     let data_as_struct =
@@ -1031,29 +1127,47 @@ pub mod arbitrary_impls {
                     }
                     iterator = next;
                 }
-                TestAccountType::Empty(_, is_signer, is_writable) => {
+                TestAccountType::Empty(_, meta) => {
                     let (acc, next) =
                         unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
                     if acc.static_data.data_len != 0 {
                         return false;
                     }
-                    if (acc.static_data.is_signer == 1) != is_signer {
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
                         return false;
                     }
-                    if (acc.static_data.is_writable == 1) != is_writable {
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
                         return false;
                     }
                     iterator = next;
                 }
-                TestAccountType::Untyped(data, is_signer, is_writable) => {
+                TestAccountType::Untyped(data, meta) => {
                     let (acc, next) = unsafe { iterator.known_next_full_account() };
                     if acc.data() != data.as_slice() {
                         return false;
                     }
-                    if (acc.static_data.is_signer == 1) != is_signer {
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
                         return false;
                     }
-                    if (acc.static_data.is_writable == 1) != is_writable {
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
                         return false;
                     }
                     iterator = next;
@@ -1061,16 +1175,25 @@ pub mod arbitrary_impls {
                 TestAccountType::AlignedArray(array) => {
                     let (accs, next) =
                         unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 2>() };
-                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
+                    for ((given, meta), acc) in array.iter().zip(accs.iter()) {
                         if acc.static_data.data_len
                             != std::mem::size_of::<QuickCheckAligned>() as u64
                         {
                             return false;
                         }
-                        if (acc.static_data.is_signer == 1) != *is_signer {
+                        if (acc.static_data.is_signer == 1) != meta.is_signer {
                             return false;
                         }
-                        if (acc.static_data.is_writable == 1) != *is_writable {
+                        if (acc.static_data.is_writable == 1) != meta.is_writable {
+                            return false;
+                        }
+                        if (acc.static_data.executable == 1) != meta.executable {
+                            return false;
+                        }
+                        if acc.static_data.lamports != meta.lamports {
+                            return false;
+                        }
+                        if acc.rent_epoch != meta.rent_epoch {
                             return false;
                         }
                         if &acc.data != given {
@@ -1082,16 +1205,25 @@ pub mod arbitrary_impls {
                 TestAccountType::AlignedArray3(array) => {
                     let (accs, next) =
                         unsafe { iterator.static_slurp_typed_accounts::<QuickCheckAligned, 3>() };
-                    for ((given, is_signer, is_writable), acc) in array.iter().zip(accs.iter()) {
+                    for ((given, meta), acc) in array.iter().zip(accs.iter()) {
                         if acc.static_data.data_len
                             != std::mem::size_of::<QuickCheckAligned>() as u64
                         {
                             return false;
                         }
-                        if (acc.static_data.is_signer == 1) != *is_signer {
+                        if (acc.static_data.is_signer == 1) != meta.is_signer {
                             return false;
                         }
-                        if (acc.static_data.is_writable == 1) != *is_writable {
+                        if (acc.static_data.is_writable == 1) != meta.is_writable {
+                            return false;
+                        }
+                        if (acc.static_data.executable == 1) != meta.executable {
+                            return false;
+                        }
+                        if acc.static_data.lamports != meta.lamports {
+                            return false;
+                        }
+                        if acc.rent_epoch != meta.rent_epoch {
                             return false;
                         }
                         if &acc.data != given {
@@ -1267,16 +1399,18 @@ mod tests {
                 NextAccount::Account(parsed_account, next_iter) => {
                     match (expected_account, parsed_account) {
                         (
-                            TestAccount::Real(expected, expected_data),
+                            TestAccount::Real(expected, expected_data, expected_rent_epoch),
                             AccountInInstruction::RealAccount(parsed),
                         ) => {
                             assert_eq!(parsed.static_data.is_signer, expected.is_signer);
                             assert_eq!(parsed.static_data.is_writable, expected.is_writable);
+                            assert_eq!(parsed.static_data.executable, expected.executable);
                             assert_eq!(parsed.static_data.data_len, expected.data_len);
                             assert_eq!(parsed.static_data.key, expected.key);
                             assert_eq!(parsed.static_data.owner, expected.owner);
                             assert_eq!(parsed.static_data.lamports, expected.lamports);
                             assert_eq!(parsed.data(), expected_data);
+                            assert_eq!(*parsed.rent_epoch, expected_rent_epoch);
                         }
                         (
                             TestAccount::Duplicate(expected_index),
@@ -1312,27 +1446,27 @@ mod tests {
 
         let test_cases = vec![
             (vec![], vec![1, 2, 3, 4]),
-            (vec![TestAccount::Real(account1, data1.clone())], vec![5, 6]),
+            (vec![TestAccount::Real(account1, data1.clone(), 0)], vec![5, 6]),
             (
                 vec![
-                    TestAccount::Real(account1, data1.clone()),
-                    TestAccount::Real(account2, data2.clone()),
+                    TestAccount::Real(account1, data1.clone(), 0),
+                    TestAccount::Real(account2, data2.clone(), 0),
                 ],
                 vec![7, 8, 9],
             ),
             (
                 vec![
-                    TestAccount::Real(account1, data1.clone()),
+                    TestAccount::Real(account1, data1.clone(), 0),
                     TestAccount::Duplicate(0),
-                    TestAccount::Real(account2, data2.clone()),
+                    TestAccount::Real(account2, data2.clone(), 0),
                 ],
                 vec![10],
             ),
             (
                 vec![
-                    TestAccount::Real(account1, data1),
-                    TestAccount::Real(account2, data2),
-                    TestAccount::Real(account3, data3),
+                    TestAccount::Real(account1, data1, 0),
+                    TestAccount::Real(account2, data2, 0),
+                    TestAccount::Real(account3, data3, 0),
                     TestAccount::Duplicate(1),
                 ],
                 vec![],
@@ -1362,7 +1496,7 @@ mod tests {
         let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
         let instruction_data = vec![5, 6, 7, 8];
         let mut instruction = create_test_instruction(
-            vec![TestAccount::Real(account, data)],
+            vec![TestAccount::Real(account, data, 0)],
             instruction_data.clone(),
         );
 
@@ -1390,8 +1524,8 @@ mod tests {
         let instruction_data = vec![11, 12];
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account1, data1),
-                TestAccount::Real(account2, data2),
+                TestAccount::Real(account1, data1, 0),
+                TestAccount::Real(account2, data2, 0),
             ],
             instruction_data.clone(),
         );
@@ -1418,7 +1552,7 @@ mod tests {
     fn test_dup_account() {
         let (account, data) = create_test_account(false, false, vec![1, 2, 3, 4]);
         let mut instruction = create_test_instruction(
-            vec![TestAccount::Duplicate(0), TestAccount::Real(account, data)],
+            vec![TestAccount::Duplicate(0), TestAccount::Real(account, data, 0)],
             vec![],
         );
 
@@ -1447,6 +1581,7 @@ mod tests {
                 TestAccount::Real(
                     create_test_account(false, false, vec![1, 2, 3, 4]).0,
                     vec![1, 2, 3, 4],
+                    0,
                 )
             })
             .collect();
@@ -1483,8 +1618,8 @@ mod tests {
         let (account2, data2) = create_test_account(false, false, vec![5, 6, 7, 8, 9, 10]);
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account1, data1),
-                TestAccount::Real(account2, data2),
+                TestAccount::Real(account1, data1, 0),
+                TestAccount::Real(account2, data2, 0),
             ],
             vec![],
         );
@@ -1516,8 +1651,8 @@ mod tests {
         let (account2, data2) = create_test_account(true, true, vec![5, 6, 7, 8, 9, 10]);
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account1, data1.clone()),
-                TestAccount::Real(account2, data2.clone()),
+                TestAccount::Real(account1, data1.clone(), 0),
+                TestAccount::Real(account2, data2.clone(), 0),
             ],
             vec![],
         );
@@ -1547,7 +1682,7 @@ mod tests {
     fn test_known_next_full_account() {
         let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, _) = unsafe { iterator.known_next_full_account() };
@@ -1577,13 +1712,17 @@ mod tests {
 
         let (account, _) = create_test_account(true, true, data_bytes);
         let mut instruction = create_test_instruction(
-            vec![TestAccount::Real(account, unsafe {
-                std::slice::from_raw_parts(
-                    &test_data as *const _ as *const u8,
-                    std::mem::size_of::<TestStruct>(),
-                )
-                .to_vec()
-            })],
+            vec![TestAccount::Real(
+                account,
+                unsafe {
+                    std::slice::from_raw_parts(
+                        &test_data as *const _ as *const u8,
+                        std::mem::size_of::<TestStruct>(),
+                    )
+                    .to_vec()
+                },
+                0,
+            )],
             vec![],
         );
 
@@ -1603,7 +1742,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // size % 8 == 0
         let (account, _) = create_test_account(true, false, data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, _) = unsafe { iterator.known_next_full_account() };
@@ -1617,7 +1756,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5]; // size % 8 != 0
         let (account, _) = create_test_account(true, false, data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, _) = unsafe { iterator.known_next_full_account() };
@@ -1631,7 +1770,7 @@ mod tests {
         let data = vec![]; // zero size
         let (account, _) = create_test_account(true, false, data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, _) = unsafe { iterator.known_next_full_account() };
@@ -1701,7 +1840,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 8 bytes - aligned
         let (account, _) = create_test_account(true, false, data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![9, 10]);
+            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![9, 10]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, next_iter) = unsafe { iterator.aligned_known_next_full_account() };
@@ -1727,8 +1866,8 @@ mod tests {
         let (account2, _) = create_test_account(false, true, data2.clone());
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account1, data1.clone()),
-                TestAccount::Real(account2, data2.clone()),
+                TestAccount::Real(account1, data1.clone(), 0),
+                TestAccount::Real(account2, data2.clone(), 0),
             ],
             vec![],
         );
@@ -1751,7 +1890,7 @@ mod tests {
         let instruction_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let (account, data) = create_test_account(true, true, vec![10, 20, 30]);
         let mut instruction = create_test_instruction(
-            vec![TestAccount::Real(account, data)],
+            vec![TestAccount::Real(account, data, 0)],
             instruction_data.clone(),
         );
 
@@ -1783,7 +1922,7 @@ mod tests {
         let data = vec![1, 2, 3, 4];
         let (account, _) = create_test_account(true, false, data.clone());
         let mut instruction = create_test_instruction_with_rent_epoch(
-            vec![TestAccount::Real(account, data)],
+            vec![TestAccount::Real(account, data, 0)],
             vec![],
             rent_epoch_value,
         );
@@ -1800,7 +1939,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let (account, _) = create_test_account(false, true, data.clone());
         let mut instruction = create_test_instruction_with_rent_epoch(
-            vec![TestAccount::Real(account, data)],
+            vec![TestAccount::Real(account, data, 0)],
             vec![],
             rent_epoch_value,
         );
@@ -1818,9 +1957,9 @@ mod tests {
         let (account3, data3) = create_test_account(true, true, vec![9, 10]);
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account1, data1),
-                TestAccount::Real(account2, data2),
-                TestAccount::Real(account3, data3),
+                TestAccount::Real(account1, data1, 0),
+                TestAccount::Real(account2, data2, 0),
+                TestAccount::Real(account3, data3, 0),
             ],
             vec![],
         );
@@ -1842,7 +1981,7 @@ mod tests {
     fn test_base_ptr_accessor() {
         let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data)], vec![5, 6]);
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![5, 6]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let initial_ptr = iterator.base_ptr();
@@ -1865,7 +2004,7 @@ mod tests {
         let accounts: Vec<TestAccount> = (0..256)
             .map(|i| {
                 let (acc, data) = create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
-                TestAccount::Real(acc, data)
+                TestAccount::Real(acc, data, 0)
             })
             .collect();
 
@@ -1896,7 +2035,7 @@ mod tests {
         let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account, data),
+                TestAccount::Real(account, data, 0),
                 TestAccount::Duplicate(0),
                 TestAccount::Duplicate(0),
                 TestAccount::Duplicate(0),
@@ -1943,9 +2082,9 @@ mod tests {
 
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(account0, data0),
-                TestAccount::Real(account1, data1),
-                TestAccount::Real(account2, data2),
+                TestAccount::Real(account0, data0, 0),
+                TestAccount::Real(account1, data1, 0),
+                TestAccount::Real(account2, data2, 0),
                 TestAccount::Duplicate(2), // dup of account2
                 TestAccount::Duplicate(0), // dup of account0
                 TestAccount::Duplicate(1), // dup of account1
@@ -1984,7 +2123,7 @@ mod tests {
         let data = vec![0xEF, 0xBE, 0xAD, 0xDE]; // Some "program" data
         let (account, _) = create_test_account_full(false, false, true, 1000000, data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, _) = unsafe { iterator.known_next_full_account() };
@@ -2004,7 +2143,7 @@ mod tests {
         for lamports in [0u64, 1, 100, 1_000_000_000, u64::MAX] {
             let (account, _) = create_test_account_full(true, true, false, lamports, data.clone());
             let mut instruction =
-                create_test_instruction(vec![TestAccount::Real(account, data.clone())], vec![]);
+                create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![]);
 
             let iterator =
                 unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -2019,7 +2158,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let (account, _) = create_test_account(true, true, data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, data)], vec![]);
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, _) = unsafe { iterator.known_next_full_account() };
@@ -2080,7 +2219,7 @@ mod tests {
         let instruction_data: Vec<u8> = (0..10240).map(|i| (i & 0xFF) as u8).collect();
         let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
         let mut instruction = create_test_instruction(
-            vec![TestAccount::Real(account, data)],
+            vec![TestAccount::Real(account, data, 0)],
             instruction_data.clone(),
         );
 
@@ -2098,7 +2237,7 @@ mod tests {
         let large_data: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
         let (account, _) = create_test_account(true, true, large_data.clone());
         let mut instruction =
-            create_test_instruction(vec![TestAccount::Real(account, large_data.clone())], vec![42]);
+            create_test_instruction(vec![TestAccount::Real(account, large_data.clone(), 0)], vec![42]);
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, next_iter) = unsafe { iterator.known_next_full_account() };
@@ -2165,7 +2304,7 @@ mod tests {
                     .to_vec()
                 };
                 let (acc, _) = create_test_account(true, true, data_bytes.clone());
-                TestAccount::Real(acc, data_bytes)
+                TestAccount::Real(acc, data_bytes, 0)
             })
             .collect();
 
@@ -2214,8 +2353,8 @@ mod tests {
 
         let mut instruction = create_test_instruction(
             vec![
-                TestAccount::Real(authority_acc, authority_data),
-                TestAccount::Real(token_acc, token_bytes),
+                TestAccount::Real(authority_acc, authority_data, 0),
+                TestAccount::Real(token_acc, token_bytes, 0),
             ],
             vec![1, 2, 3], // instruction discriminator
         );
@@ -2234,5 +2373,95 @@ mod tests {
         // Step 3: Get instruction data
         let instr_data = unsafe { next_iter.known_instruction_data() };
         assert_eq!(instr_data, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_max_dup_index_254() {
+        // Create 255 real accounts, then a dup with index 254
+        let mut accounts: Vec<TestAccount> = (0..255)
+            .map(|i| {
+                let (acc, data) = create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
+                TestAccount::Real(acc, data, 0)
+            })
+            .collect();
+
+        // Add a dup pointing to account 254 (the last real account)
+        accounts.push(TestAccount::Duplicate(254));
+
+        let mut instruction = create_test_instruction(accounts, vec![0xAB]);
+
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Skip past the 255 real accounts
+        for _ in 0..255 {
+            match iterator.next() {
+                NextAccount::Account(AccountInInstruction::RealAccount(_), next) => {
+                    iterator = next;
+                }
+                _ => panic!("Expected real account"),
+            }
+        }
+
+        // The 256th account should be a dup with index 254
+        match iterator.next() {
+            NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+                assert_eq!(idx, 254);
+                iterator = next;
+            }
+            _ => panic!("Expected dup account with index 254"),
+        }
+
+        // Verify instruction data
+        match iterator.next() {
+            NextAccount::Data(data) => assert_eq!(data, &[0xAB]),
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_very_large_instruction_data() {
+        // Test with 64KB of instruction data
+        let instruction_data: Vec<u8> = (0..65536).map(|i| (i & 0xFF) as u8).collect();
+        let (account, data) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let mut instruction = create_test_instruction(
+            vec![TestAccount::Real(account, data, 0)],
+            instruction_data.clone(),
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (_, next_iter) = unsafe { iterator.known_next_full_account() };
+
+        let instr_data = unsafe { next_iter.known_instruction_data() };
+        assert_eq!(instr_data.len(), 65536);
+        assert_eq!(instr_data, instruction_data.as_slice());
+    }
+
+    #[test]
+    fn test_instruction_data_edge_sizes() {
+        // Test instruction data at various edge sizes
+        let edge_sizes = [0, 1, 7, 8, 9, 15, 16, 17, 127, 128, 255, 256, 1023, 1024, 4095, 4096];
+
+        for size in edge_sizes {
+            let instruction_data: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+            let (account, data) = create_test_account(true, true, vec![0xAA]);
+            let mut instruction = create_test_instruction(
+                vec![TestAccount::Real(account, data, 0)],
+                instruction_data.clone(),
+            );
+
+            let iterator =
+                unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+            let (_, next_iter) = unsafe { iterator.known_next_full_account() };
+
+            let instr_data = unsafe { next_iter.known_instruction_data() };
+            assert_eq!(
+                instr_data.len(),
+                size,
+                "Instruction data size mismatch for size {}",
+                size
+            );
+            assert_eq!(instr_data, instruction_data.as_slice());
+        }
     }
 }
