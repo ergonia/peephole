@@ -847,6 +847,9 @@ pub mod arbitrary_impls {
         Untyped(Vec<u8>, bool, bool),
         AlignedArray([(QuickCheckAligned, bool, bool); 2]),
         AlignedArray3([(QuickCheckAligned, bool, bool); 3]),
+        /// Duplicate of a previous account. The u8 is a hint that will be
+        /// taken modulo the number of real accounts seen so far.
+        Duplicate(u8),
     }
 
     #[cfg(test)]
@@ -862,7 +865,7 @@ pub mod arbitrary_impls {
                     bool::arbitrary(g),
                 )
             }
-            match u8::arbitrary(g) % 6 {
+            match u8::arbitrary(g) % 8 {
                 0 => TestAccountType::Aligned(
                     QuickCheckAligned {
                         a: u64::arbitrary(g),
@@ -890,7 +893,9 @@ pub mod arbitrary_impls {
                     TestAccountType::Untyped(data, bool::arbitrary(g), bool::arbitrary(g))
                 }
                 4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
-                _ => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
+                5 => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
+                // ~25% chance of generating a duplicate (2 out of 8 cases)
+                _ => TestAccountType::Duplicate(u8::arbitrary(g)),
             }
         }
     }
@@ -927,13 +932,52 @@ pub mod arbitrary_impls {
                     create_test_account(*is_signer, *is_writable, data)
                 })
                 .collect(),
+            // Duplicates are handled separately in create_test_accounts_from_types
+            TestAccountType::Duplicate(_) => vec![],
         }
+    }
+
+    /// Converts a list of TestAccountType into a flat list of TestAccount,
+    /// properly handling duplicates by computing valid indices based on
+    /// how many real accounts have been seen so far.
+    pub fn create_test_accounts_from_types(account_types: &[TestAccountType]) -> Vec<TestAccount> {
+        let mut result = Vec::new();
+        let mut real_account_count = 0usize;
+
+        for account_type in account_types {
+            match account_type {
+                TestAccountType::Duplicate(hint) => {
+                    // Only create a dup if there's at least one real account to reference
+                    if real_account_count > 0 {
+                        let dup_index = (*hint as usize) % real_account_count;
+                        result.push(TestAccount::Duplicate(dup_index as u8));
+                    }
+                    // If no real accounts yet, skip this dup (can't reference anything)
+                }
+                other => {
+                    let real_accounts = create_account_from_type(other.clone());
+                    for (acc, data) in real_accounts {
+                        result.push(TestAccount::Real(acc, data));
+                        real_account_count += 1;
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     pub fn do_quickcheck_mixed_account_types_with_arrays(
         account_types: Vec<TestAccountType>,
         instruction_data_gen: Vec<u8>,
     ) -> bool {
+        // Filter out Duplicate variants since typed slurping doesn't support them.
+        // Duplicate handling is tested separately in do_quickcheck_compare_with_solana_deserialize.
+        let account_types: Vec<_> = account_types
+            .into_iter()
+            .filter(|t| !matches!(t, TestAccountType::Duplicate(_)))
+            .collect();
+
         let accounts: Vec<_> = account_types
             .iter()
             .flat_map(|t| {
@@ -1056,6 +1100,10 @@ pub mod arbitrary_impls {
                     }
                     iterator = next;
                 }
+                TestAccountType::Duplicate(_) => {
+                    // Duplicates are filtered out before this loop, so this is unreachable
+                    unreachable!("Duplicate variants should have been filtered out")
+                }
             }
         }
 
@@ -1070,17 +1118,10 @@ pub mod arbitrary_impls {
         account_types: Vec<TestAccountType>,
         instruction_data_gen: Vec<u8>,
     ) -> bool {
-        // 1. Generate TestAccount structures from TestAccountType
-        let test_accounts: Vec<_> = account_types
-            .iter()
-            .flat_map(|t| {
-                let accounts = create_account_from_type(t.clone());
-                accounts
-                    .into_iter()
-                    .map(|(acc, data)| TestAccount::Real(acc, data))
-            })
-            // We do this truncation to limit the number of accounts to 256
-            // to match pinochio entrypoint limit
+        // 1. Generate TestAccount structures from TestAccountType (including dups)
+        let test_accounts: Vec<_> = create_test_accounts_from_types(&account_types)
+            .into_iter()
+            // Truncate to 256 accounts to match pinocchio entrypoint limit
             .take(256)
             .collect();
 
@@ -1135,7 +1176,7 @@ pub mod arbitrary_impls {
         {
             match fast_acc {
                 AccountInInstruction::RealAccount(fast_real) => {
-                    // Compare fields
+                    // Compare fields for real accounts
                     if fast_real.static_data.key != *solana_acc.get_key() {
                         eprintln!("Key mismatch at index {}", i);
                         return false;
@@ -1169,8 +1210,38 @@ pub mod arbitrary_impls {
                         return false;
                     }
                 }
-                AccountInInstruction::Dup(_) => {
-                    panic!("We do not fuzz dups yet")
+                AccountInInstruction::Dup(dup_index) => {
+                    // For duplicates, Solana gives us a full AccountInfo that should
+                    // have the same key as the original account at dup_index.
+                    // The data also points to the same underlying buffer.
+                    let original_solana_acc = &accounts_solana[*dup_index];
+
+                    // Verify the duplicate has the same key as the original
+                    if solana_acc.get_key() != original_solana_acc.get_key() {
+                        eprintln!(
+                            "Dup key mismatch at index {}: expected key of account {}, got different key",
+                            i, dup_index
+                        );
+                        return false;
+                    }
+
+                    // Verify owner matches
+                    if solana_acc.get_owner() != original_solana_acc.get_owner() {
+                        eprintln!("Dup owner mismatch at index {}", i);
+                        return false;
+                    }
+
+                    // Verify data matches (same underlying buffer)
+                    if solana_acc.get_data() != original_solana_acc.get_data() {
+                        eprintln!("Dup data mismatch at index {}", i);
+                        return false;
+                    }
+
+                    // Verify lamports match
+                    if solana_acc.get_lamports() != original_solana_acc.get_lamports() {
+                        eprintln!("Dup lamports mismatch at index {}", i);
+                        return false;
+                    }
                 }
             }
         }
