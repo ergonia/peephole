@@ -6,7 +6,8 @@ Zero-copy account parsing for Solana programs.
 
 `solana_program::entrypoint::deserialize` allocates `AccountInfo` structs and copies account data. peephole skips that with a zero-alloc and zero-copy view over the account and instruction data.
 
-Real-world: [51 CU oracle update](https://solscan.io/tx/JkGJc3Q2eAjPKWG4PjbNxYguqc6gAqD96bMaAmqrotH2dn5cWXV7w8Sgp7tbckr1QKqab6749rhgPjTnQEDwDkB), [67 CU for 3 oracle updates](https://solscan.io/tx/4w5T3BrUUb2zmcuVwZjNaiHY2ysfMeMNa5NE9bHfoywc8iPTJCfcFndZ2C9TyGQTj3jLMaVRALbRDDpWV9HAEHhU).
+Real-world: [51 CU oracle update](https://solscan.io/tx/JkGJc3Q2eAjPKWG4PjbNxYguqc6gAqD96bMaAmqrotH2dn5cWXV7w8Sgp7tbckr1QKqab6749rhgPjTnQEDwDkB), [67 CUs for 3 oracle updates](https://solscan.io/tx/4w5T3BrUUb2zmcuVwZjNaiHY2ysfMeMNa5NE9bHfoywc8iPTJCfcFndZ2C9TyGQTj3jLMaVRALbRDDpWV9HAEHhU),
+[<20 CUs](https://solscan.io/tx/45Kzs3dkFQqq5BDB8qqp2F3QpBoeRLbzvnLBHZ6ZpL2EUJrBUzm4dcf4dquXt8dKvySHpHiPd5JMgKDmmKF3rn3r) for other production contracts.
 
 ## Installation
 
