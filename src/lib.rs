@@ -28,9 +28,8 @@
 //!         NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
 //!             iter = next;
 //!         }
-//!         NextAccount::Data(instruction_data, program_iter) => {
-//!             // Access the program ID after instruction data
-//!             let program_id = program_iter.program_address();
+//!         NextAccount::Data(instruction_data, program_id) => {
+//!             // instruction_data: &mut [u8], program_id: &Pubkey
 //!             break;
 //!         }
 //!     }

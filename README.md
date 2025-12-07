@@ -37,7 +37,10 @@ loop {
             // Duplicate of account `idx`—runtime only serializes full data once
             iter = next;
         }
-        NextAccount::Data(instruction_data) => break,
+        NextAccount::Data(instruction_data, program_id) => {
+            // instruction_data: &mut [u8], program_id: &Pubkey
+            break;
+        }
     }
 }
 ```
@@ -123,6 +126,8 @@ acc.static_data.is_executable() // -> bool
 │ instruction_data_len: u64                   │
 ├─────────────────────────────────────────────┤
 │ instruction_data: [u8]                      │
+├─────────────────────────────────────────────┤
+│ program_id: Pubkey (32 bytes)               │
 └─────────────────────────────────────────────┘
 ```
 
@@ -152,7 +157,7 @@ Real account layout:
 ```rust
 pub enum NextAccount {
     Account(AccountInInstruction, AccountIterator),
-    Data(&'static mut [u8]),
+    Data(&'static mut [u8], &'static Pubkey),  // (instruction_data, program_id)
 }
 
 pub enum AccountInInstruction {

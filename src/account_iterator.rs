@@ -118,32 +118,11 @@ pub enum AccountInInstruction {
     Dup(usize),
 }
 
-/// Iterator positioned at the program address (after instruction data has been consumed).
-///
-/// This is returned as part of `NextAccount::Data` to allow accessing the program ID
-/// that the Solana runtime places after instruction data in the serialized buffer.
-pub struct ProgramAddressIterator {
-    ptr: *mut u8,
-}
-
-impl ProgramAddressIterator {
-    /// Returns the program address (32-byte Pubkey).
-    ///
-    /// This is the program ID of the currently executing program, placed by the
-    /// Solana runtime after the instruction data.
-    #[inline]
-    pub fn program_address(self) -> &'static Pubkey {
-        unsafe { &*(self.ptr as *const Pubkey) }
-    }
-}
-
-/// Represents the result of advancing the `AccountIterator`.
-/// It can be either the next account in the sequence or the final instruction data.
+/// Result of `AccountIterator::next()`.
 pub enum NextAccount {
-    /// The instruction data slice and iterator to access the program address.
-    /// Returned after all accounts have been processed.
-    Data(&'static mut [u8], ProgramAddressIterator),
-    /// The next account encountered and the iterator advanced past it.
+    /// All accounts consumed. Contains (instruction_data, program_id).
+    Data(&'static mut [u8], &'static Pubkey),
+    /// An account and the iterator positioned after it.
     Account(AccountInInstruction, AccountIterator),
 }
 
@@ -253,19 +232,12 @@ impl AccountIterator {
         }
     }
 
-    /// Advances the iterator and returns the next account or instruction data.
-    ///
-    /// # Returns
-    ///
-    /// A `NextAccount` enum containing either:
-    /// - `NextAccount::Account`: The next account and iterator to continue
-    /// - `NextAccount::Data`: The instruction data slice and a `ProgramAddressIterator`
-    ///   to access the program ID
+    /// Advances to the next account, or returns instruction data and program ID if done.
     #[inline(always)]
     pub fn next(self) -> NextAccount {
         if self.remaining_accounts == 0 {
-            let (slice, program_iter) = self.slurp_instruction_data();
-            NextAccount::Data(slice, program_iter)
+            let (slice, program_id) = self.slurp_instruction_data();
+            NextAccount::Data(slice, program_id)
         } else {
             let is_dup = unsafe { *self.base_ptr };
             let (acc, next) = if is_dup == NON_DUP_MARKER {
@@ -426,9 +398,6 @@ impl AccountIterator {
     ///
     /// In debug builds, this is verified with an assertion.
     ///
-    /// # Returns
-    ///
-    /// A tuple containing the instruction data slice and a reference to the program address.
     #[inline]
     pub unsafe fn known_instruction_data_and_program_address(
         self,
@@ -438,8 +407,7 @@ impl AccountIterator {
             "known_instruction_data_and_program_address called with {} accounts remaining",
             self.remaining_accounts
         );
-        let (data, program_iter) = self.slurp_instruction_data();
-        (data, program_iter.program_address())
+        self.slurp_instruction_data()
     }
 
     /// Retrieves only the program address, skipping instruction data.
@@ -557,25 +525,16 @@ impl AccountIterator {
         (data, next_bytes)
     }
 
-    /// Helper function to retrieve the instruction data and program address iterator.
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing the instruction data slice and a `ProgramAddressIterator`
-    /// positioned at the program ID that follows the instruction data.
     #[inline]
-    fn slurp_instruction_data(self) -> (&'static mut [u8], ProgramAddressIterator) {
+    fn slurp_instruction_data(self) -> (&'static mut [u8], &'static Pubkey) {
         let (instruction_length, instruction_data) = unsafe { slurp::<u64>(self.base_ptr) };
         let data = unsafe {
             core::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize)
         };
-        let program_id_ptr = unsafe { instruction_data.add(*instruction_length as usize) };
-        (
-            data,
-            ProgramAddressIterator {
-                ptr: program_id_ptr,
-            },
-        )
+        let program_id = unsafe {
+            &*(instruction_data.add(*instruction_length as usize) as *const Pubkey)
+        };
+        (data, program_id)
     }
 
     /// Number of accounts left to iterate.
@@ -1142,7 +1101,7 @@ pub mod arbitrary_impls {
                     fast_iter = next_iter;
                 }
                 NextAccount::Data(data, program_iter) => {
-                    break (data.to_vec(), *program_iter.program_address()); // Clone data for comparison
+                    break (data.to_vec(), *program_iter); // Clone data for comparison
                 }
             }
         };
@@ -1738,7 +1697,7 @@ mod tests {
         match iterator.next() {
             NextAccount::Data(data, program_iter) => {
                 assert_eq!(data, instruction_data.as_slice());
-                let program_id = program_iter.program_address();
+                let program_id = program_iter;
                 assert_eq!(*program_id, expected_program_id);
             }
             _ => panic!("Expected instruction data"),
@@ -1761,7 +1720,7 @@ mod tests {
                 match next_iter.next() {
                     NextAccount::Data(data, program_iter) => {
                         assert_eq!(data, instruction_data.as_slice());
-                        let program_id = program_iter.program_address();
+                        let program_id = program_iter;
                         assert_eq!(*program_id, expected_program_id);
                     }
                     _ => panic!("Expected instruction data"),
@@ -1823,7 +1782,7 @@ mod tests {
         match iterator.next() {
             NextAccount::Data(data, program_iter) => {
                 assert!(data.is_empty());
-                assert_eq!(*program_iter.program_address(), expected_program_id);
+                assert_eq!(*program_iter, expected_program_id);
             }
             _ => panic!("Expected instruction data"),
         }
@@ -1842,7 +1801,7 @@ mod tests {
             NextAccount::Data(data, program_iter) => {
                 assert_eq!(data.len(), 1024);
                 assert_eq!(data, large_data.as_slice());
-                assert_eq!(*program_iter.program_address(), expected_program_id);
+                assert_eq!(*program_iter, expected_program_id);
             }
             _ => panic!("Expected instruction data"),
         }
@@ -1886,7 +1845,7 @@ mod tests {
                 NextAccount::Data(data, program_iter) => {
                     assert_eq!(data.len(), len);
                     assert_eq!(
-                        *program_iter.program_address(),
+                        *program_iter,
                         expected_program_id,
                         "Program address mismatch for instruction_data len={}",
                         len
@@ -1930,7 +1889,7 @@ mod tests {
         match iterator.next() {
             NextAccount::Data(data, program_iter) => {
                 assert_eq!(data, instruction_data.as_slice());
-                assert_eq!(*program_iter.program_address(), expected_program_id);
+                assert_eq!(*program_iter, expected_program_id);
             }
             _ => panic!("Expected instruction data"),
         }
@@ -1971,7 +1930,7 @@ mod tests {
         match iterator.next() {
             NextAccount::Data(data, program_iter) => {
                 assert_eq!(data, instruction_data.as_slice());
-                assert_eq!(*program_iter.program_address(), expected_program_id);
+                assert_eq!(*program_iter, expected_program_id);
             }
             _ => panic!("Expected instruction data"),
         }
@@ -2037,7 +1996,7 @@ mod tests {
                         return false;
                     }
                     // Verify program address
-                    if *program_iter.program_address() != expected_program_id {
+                    if *program_iter != expected_program_id {
                         return false;
                     }
                     return true;
