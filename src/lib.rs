@@ -26,7 +26,11 @@
 //!             // Duplicate of account at index `idx`
 //!             iter = next;
 //!         }
-//!         NextAccount::Data(instruction_data) => break,
+//!         NextAccount::Data(instruction_data, program_iter) => {
+//!             // Access the program ID after instruction data
+//!             let program_id = program_iter.program_address();
+//!             break;
+//!         }
 //!     }
 //! }
 //! ```
