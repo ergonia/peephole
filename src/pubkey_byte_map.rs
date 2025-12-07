@@ -1,3 +1,22 @@
+//! O(1) pubkey lookup by first byte.
+//!
+//! When checking if a pubkey matches one of a known set (program IDs, authorities),
+//! iterating through them costs O(n). This module indexes pubkeys by their first byte,
+//! giving O(1) lookup.
+//!
+//! **Constraint:** all pubkeys must have unique first bytes. Works well for small sets
+//! of well-known keys (typically <20).
+//!
+//! ```ignore
+//! use peephole::pubkey_byte_map::{pubkey_byte_map, PubkeyMap};
+//!
+//! const AUTHORITIES: PubkeyMap = pubkey_byte_map(&[ADMIN_KEY, OPERATOR_KEY]);
+//!
+//! if !AUTHORITIES.contains(&signer_key) {
+//!     return Err(Unauthorized);
+//! }
+//! ```
+
 use crate::solana_export::{pubkey::Pubkey, pubkey_bytes, pubkey_from_array};
 use bytemuck::{Pod, Zeroable};
 
@@ -15,12 +34,14 @@ const fn bytes_equal(a: [u8; 32], b: [u8; 32]) -> bool {
     true
 }
 
+/// 256-slot array indexed by first byte of pubkey. Slot `i` holds the pubkey
+/// whose first byte is `i`, or zero if no such key was added.
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(align(8), C)]
 pub struct PubkeyMap(pub [Pubkey; 256]);
 
 impl PubkeyMap {
-    /// Returns true if the given public key is contained in the map.
+    /// O(1) check: looks up slot by first byte, compares full key.
     #[inline]
     pub fn contains(&self, key: &Pubkey) -> bool {
         unsafe {
@@ -33,12 +54,7 @@ impl PubkeyMap {
     }
 }
 
-/// Creates a new `PubkeyMap` from the given slice of public keys,
-/// in the existing map
-///
-/// # Panics
-///
-/// Panics if `keys` contains more than 256 elements or if any two keys share the same first byte.
+/// Populates a `PubkeyMap` from keys. Returns `Err` if >256 keys or duplicate first bytes.
 pub fn try_pubkey_byte_map(keys: &[Pubkey], key_map: &mut PubkeyMap) -> Result<(), &'static str> {
     if keys.len() > 256 {
         return Err("keys length must be less than 256");
@@ -64,11 +80,7 @@ pub fn try_pubkey_byte_map(keys: &[Pubkey], key_map: &mut PubkeyMap) -> Result<(
     Ok(())
 }
 
-/// Creates a new `PubkeyMap` from the given slice of public keys.
-///
-/// # Panics
-///
-/// Panics if `keys` contains more than 256 elements or if any two keys share the same first byte.
+/// Creates a `PubkeyMap` at compile time. Panics if >256 keys or duplicate first bytes.
 #[inline(always)]
 pub const fn pubkey_byte_map(keys: &[Pubkey]) -> PubkeyMap {
     if keys.len() > 256 {
