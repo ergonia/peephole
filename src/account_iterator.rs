@@ -849,6 +849,39 @@ pub mod arbitrary_impls {
     #[repr(C)]
     pub struct EmptyStruct {} // Zero-sized
 
+    // Test structs covering all size mod 8 remainders for alignment optimization testing
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size1Struct(pub [u8; 1]); // mod 8 = 1
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size2Struct(pub [u8; 2]); // mod 8 = 2
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size4Struct(pub [u8; 4]); // mod 8 = 4
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size5Struct(pub [u8; 5]); // mod 8 = 5
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size6Struct(pub [u8; 6]); // mod 8 = 6
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size7Struct(pub [u8; 7]); // mod 8 = 7
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size9Struct(pub [u8; 9]); // mod 8 = 1, just over 8
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size15Struct(pub [u8; 15]); // mod 8 = 7, just under 16
+
     pub fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
         let data_bytes = unsafe {
             std::slice::from_raw_parts(data as *const _ as *const u8, std::mem::size_of::<T>())
@@ -1872,6 +1905,145 @@ mod tests {
         assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
     }
 
+    // Tests for all mod 8 size remainders to verify alignment optimization
+    #[test]
+    fn test_typed_known_next_full_account_size1() {
+        let data = Size1Struct([0x42]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size1Struct>() };
+
+        assert_eq!(acc.data().len(), 1);
+        assert_eq!(acc.data()[0], 0x42);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size2() {
+        let data = Size2Struct([0x12, 0x34]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size2Struct>() };
+
+        assert_eq!(acc.data().len(), 2);
+        assert_eq!(acc.data(), &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size4() {
+        let data = Size4Struct([0x11, 0x22, 0x33, 0x44]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size4Struct>() };
+
+        assert_eq!(acc.data().len(), 4);
+        assert_eq!(acc.data(), &[0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size5() {
+        let data = Size5Struct([0x01, 0x02, 0x03, 0x04, 0x05]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size5Struct>() };
+
+        assert_eq!(acc.data().len(), 5);
+        assert_eq!(acc.data(), &[0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size6() {
+        let data = Size6Struct([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size6Struct>() };
+
+        assert_eq!(acc.data().len(), 6);
+        assert_eq!(acc.data(), &[0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size7() {
+        let data = Size7Struct([0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size7Struct>() };
+
+        assert_eq!(acc.data().len(), 7);
+        assert_eq!(acc.data(), &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size9() {
+        let data = Size9Struct([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size9Struct>() };
+
+        assert_eq!(acc.data().len(), 9);
+        assert_eq!(
+            acc.data(),
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+        );
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size15() {
+        let data = Size15Struct([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size15Struct>() };
+
+        assert_eq!(acc.data().len(), 15);
+        assert_eq!(
+            acc.data(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    // Test multiple accounts with different sizes to verify pointer advancement
+    #[test]
+    fn test_typed_known_next_full_account_mixed_sizes() {
+        let data1 = Size1Struct([0xAA]);
+        let data7 = Size7Struct([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        let data5 = Size5Struct([0x10, 0x20, 0x30, 0x40, 0x50]);
+
+        let data1_bytes = data1.0.to_vec();
+        let data7_bytes = data7.0.to_vec();
+        let data5_bytes = data5.0.to_vec();
+
+        let (account1, _) = create_test_account(true, true, data1_bytes.clone());
+        let (account7, _) = create_test_account(true, true, data7_bytes.clone());
+        let (account5, _) = create_test_account(true, true, data5_bytes.clone());
+
+        let (mut instruction, _) = create_test_instruction(
+            vec![
+                TestAccount::Real(account1, data1_bytes, 0),
+                TestAccount::Real(account7, data7_bytes, 0),
+                TestAccount::Real(account5, data5_bytes, 0),
+            ],
+            vec![0xDE, 0xAD],
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        let (acc1, iterator) = unsafe { iterator.typed_known_next_full_account::<Size1Struct>() };
+        assert_eq!(acc1.data().len(), 1);
+        assert_eq!(acc1.data()[0], 0xAA);
+
+        let (acc7, iterator) = unsafe { iterator.typed_known_next_full_account::<Size7Struct>() };
+        assert_eq!(acc7.data().len(), 7);
+        assert_eq!(acc7.data(), &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+
+        let (acc5, iterator) = unsafe { iterator.typed_known_next_full_account::<Size5Struct>() };
+        assert_eq!(acc5.data().len(), 5);
+        assert_eq!(acc5.data(), &[0x10, 0x20, 0x30, 0x40, 0x50]);
+
+        // Verify we can still read instruction data and program address
+        let (instr_data, _program_id) =
+            unsafe { iterator.known_instruction_data_and_program_address() };
+        assert_eq!(instr_data, &[0xDE, 0xAD]);
+    }
+
     #[quickcheck_macros::quickcheck]
     fn quickcheck_mixed_account_types_with_arrays(
         account_types: Vec<TestAccountType>,
@@ -2820,6 +2992,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "known_program_address called with")]
     fn test_known_program_address_panics_with_remaining_accounts() {
         // Debug assertion: calling known_program_address before consuming all accounts should panic
@@ -2834,6 +3007,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "known_instruction_data_and_program_address called with")]
     fn test_known_instruction_data_and_program_address_panics_with_remaining_accounts() {
         // Debug assertion: calling known_instruction_data_and_program_address before consuming all accounts should panic
