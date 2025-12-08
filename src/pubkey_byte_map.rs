@@ -369,9 +369,9 @@ const ERROR_MSGS: [&str; 256] = [
 
 #[cfg(test)]
 mod tests {
+    use crate::solana_export::unique_pubkey;
     #[allow(unused_imports)]
     use std::{vec, vec::Vec};
-    use crate::solana_export::unique_pubkey;
 
     use super::*;
 

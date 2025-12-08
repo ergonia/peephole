@@ -168,9 +168,9 @@ pub const fn validate_aligned<T: Sized>(base: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use bytemuck::Zeroable;
     #[allow(unused_imports)]
     use std::{vec, vec::Vec};
-    use bytemuck::Zeroable;
 
     use super::*;
 
