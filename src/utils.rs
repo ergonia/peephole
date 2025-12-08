@@ -1,4 +1,5 @@
 use crate::solana_export::pubkey::Pubkey;
+use core::ptr::read_volatile;
 
 /// Performs a fast comparison of two Solana public keys.
 ///
@@ -38,16 +39,26 @@ use crate::solana_export::pubkey::Pubkey;
 /// let pubkey2 = pubkey1;
 /// assert!(fast_cmp_pubkey(&pubkey1, &pubkey2));
 /// ```
-#[inline(always)]
-pub fn fast_cmp_pubkey(a: &Pubkey, b: &Pubkey) -> bool {
-    // we could save a few CUs (~3) doing this in assembly as the compiler
-    // tries to be cute and optimize for the case where we can exit early
-    // at the cost of the full comparison. Not worth it really though
-    unsafe {
-        let a: &[u64; 4] = core::mem::transmute(a);
-        let b: &[u64; 4] = core::mem::transmute(b);
 
-        a == b
+pub fn fast_cmp_pubkey(a: &Pubkey, b: &Pubkey) -> bool {
+    // IMPORTANT: read_volatile is load-bearing here.
+    //
+    // Without it, LLVM recognizes the 32-byte comparison pattern and "optimizes"
+    // it into a memcmp call, which is catastrophic on BPF (external syscall).
+    // Even explicit element-wise `a[i] == b[i] && ...` gets pattern-matched back
+    // to memcmp. XOR-OR patterns get pessimized into spilling intermediates to
+    // the stack. black_box hints cause similar stack spills.
+    //
+    // read_volatile prevents LLVM from reasoning about the loads, forcing it to
+    // emit the straightforward load-compare-branch sequence we actually want.
+    unsafe {
+        let a = a as *const Pubkey as *const u64;
+        let b = b as *const Pubkey as *const u64;
+
+        read_volatile(a) == read_volatile(b)
+            && read_volatile(a.add(1)) == read_volatile(b.add(1))
+            && read_volatile(a.add(2)) == read_volatile(b.add(2))
+            && read_volatile(a.add(3)) == read_volatile(b.add(3))
     }
 }
 
