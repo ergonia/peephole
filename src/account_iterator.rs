@@ -273,12 +273,13 @@ impl AccountIterator {
         })
     }
 
-    /// Like `known_next_full_account`, but also assumes the data is already 8-byte aligned.
-    /// Skips alignment calculation for a minor speedup when you know alignment is guaranteed.
+    /// Like `known_next_full_account`, but also assumes the next account pointer is already
+    /// 8-byte aligned (i.e., aligned to `BPF_ALIGN_OF_U128`). Skips alignment calculation
+    /// for a minor speedup when you know alignment is guaranteed.
     ///
     /// # Safety
     ///
-    /// Next account must be real and already 8-byte aligned.
+    /// Next account must be real and the next account pointer must be 8-byte aligned.
     #[inline]
     pub unsafe fn aligned_known_next_full_account(
         self,
@@ -302,14 +303,14 @@ impl AccountIterator {
         })
     }
 
-    /// Gets the next account, assuming it's real and its data exactly fits type `T`.
-    /// Uses compile-time size for faster pointer arithmetic.
+    /// Gets the next account, assuming it's real and its data matches type `T`'s
+    /// size and alignment. Uses compile-time size for faster pointer arithmetic.
     ///
     /// # Safety
     ///
-    /// Next account must be real with `data_len == size_of::<T>()`.
+    /// Next account must be real with `data_len == size_of::<T>()` and proper alignment for `T`.
     #[inline]
-    pub unsafe fn typed_known_next_full_account<T>(
+    pub unsafe fn like_type_known_next_full_account<T>(
         self,
     ) -> (NonDupAccount<'static>, AccountIterator) {
         debug_assert!(self.remaining_accounts > 0);
@@ -1121,7 +1122,7 @@ pub mod arbitrary_impls {
                 }
                 TestAccountType::Unaligned(un, meta) => {
                     let (acc, next) =
-                        unsafe { iterator.typed_known_next_full_account::<QuickCheckUnaligned>() };
+                        unsafe { iterator.like_type_known_next_full_account::<QuickCheckUnaligned>() };
                     if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
                     {
                         return false;
@@ -1150,7 +1151,7 @@ pub mod arbitrary_impls {
                 }
                 TestAccountType::Empty(_, meta) => {
                     let (acc, next) =
-                        unsafe { iterator.typed_known_next_full_account::<QuickCheckEmpty>() };
+                        unsafe { iterator.like_type_known_next_full_account::<QuickCheckEmpty>() };
                     if acc.static_data.data_len != 0 {
                         return false;
                     }
@@ -1746,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_known_next_full_account() {
+    fn test_like_type_known_next_full_account() {
         let test_data = TestStruct { a: 1, b: 2 };
         let data_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -1773,7 +1774,7 @@ mod tests {
         );
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<TestStruct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<TestStruct>() };
 
         let data_as_struct = unsafe { &*(acc.data_ptr() as *const TestStruct) };
         assert_eq!(data_as_struct.a, 1);
@@ -1826,11 +1827,11 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_known_next_full_account_aligned() {
+    fn test_like_type_known_next_full_account_aligned() {
         let aligned_data = AlignedStruct { a: 1, b: 2 };
         let mut instruction = create_typed_test_instruction(&aligned_data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<AlignedStruct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<AlignedStruct>() };
 
         let data_as_struct = unsafe { &*(acc.data_ptr() as *const AlignedStruct) };
         assert_eq!(data_as_struct.a, 1);
@@ -1839,11 +1840,11 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_known_next_full_account_unaligned() {
+    fn test_like_type_known_next_full_account_unaligned() {
         let unaligned_data = UnalignedStruct { a: 1, b: 2 };
         let mut instruction = create_typed_test_instruction(&unaligned_data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<UnalignedStruct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<UnalignedStruct>() };
 
         let data_as_struct = unsafe { &*(acc.data_ptr() as *const UnalignedStruct) };
         assert_eq!(data_as_struct.a, 1);
@@ -1852,11 +1853,11 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_known_next_full_account_empty() {
+    fn test_like_type_known_next_full_account_empty() {
         let empty_data = EmptyStruct {};
         let mut instruction = create_typed_test_instruction(&empty_data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<EmptyStruct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<EmptyStruct>() };
 
         assert_eq!(acc.data().len(), 0);
         assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
