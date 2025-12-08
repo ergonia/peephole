@@ -1908,77 +1908,77 @@ mod tests {
 
     // Tests for all mod 8 size remainders to verify alignment optimization
     #[test]
-    fn test_typed_known_next_full_account_size1() {
+    fn test_like_type_known_next_full_account_size1() {
         let data = Size1Struct([0x42]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size1Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
 
         assert_eq!(acc.data().len(), 1);
         assert_eq!(acc.data()[0], 0x42);
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size2() {
+    fn test_like_type_known_next_full_account_size2() {
         let data = Size2Struct([0x12, 0x34]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size2Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size2Struct>() };
 
         assert_eq!(acc.data().len(), 2);
         assert_eq!(acc.data(), &[0x12, 0x34]);
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size4() {
+    fn test_like_type_known_next_full_account_size4() {
         let data = Size4Struct([0x11, 0x22, 0x33, 0x44]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size4Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size4Struct>() };
 
         assert_eq!(acc.data().len(), 4);
         assert_eq!(acc.data(), &[0x11, 0x22, 0x33, 0x44]);
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size5() {
+    fn test_like_type_known_next_full_account_size5() {
         let data = Size5Struct([0x01, 0x02, 0x03, 0x04, 0x05]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size5Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size5Struct>() };
 
         assert_eq!(acc.data().len(), 5);
         assert_eq!(acc.data(), &[0x01, 0x02, 0x03, 0x04, 0x05]);
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size6() {
+    fn test_like_type_known_next_full_account_size6() {
         let data = Size6Struct([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size6Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size6Struct>() };
 
         assert_eq!(acc.data().len(), 6);
         assert_eq!(acc.data(), &[0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size7() {
+    fn test_like_type_known_next_full_account_size7() {
         let data = Size7Struct([0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size7Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
 
         assert_eq!(acc.data().len(), 7);
         assert_eq!(acc.data(), &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size9() {
+    fn test_like_type_known_next_full_account_size9() {
         let data = Size9Struct([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size9Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size9Struct>() };
 
         assert_eq!(acc.data().len(), 9);
         assert_eq!(
@@ -1988,11 +1988,11 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_known_next_full_account_size15() {
+    fn test_like_type_known_next_full_account_size15() {
         let data = Size15Struct([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         let mut instruction = create_typed_test_instruction(&data);
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size15Struct>() };
+        let (acc, _) = unsafe { iterator.like_type_known_next_full_account::<Size15Struct>() };
 
         assert_eq!(acc.data().len(), 15);
         assert_eq!(
@@ -2003,7 +2003,7 @@ mod tests {
 
     // Test multiple accounts with different sizes to verify pointer advancement
     #[test]
-    fn test_typed_known_next_full_account_mixed_sizes() {
+    fn test_like_type_known_next_full_account_mixed_sizes() {
         let data1 = Size1Struct([0xAA]);
         let data7 = Size7Struct([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
         let data5 = Size5Struct([0x10, 0x20, 0x30, 0x40, 0x50]);
@@ -2027,15 +2027,15 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        let (acc1, iterator) = unsafe { iterator.typed_known_next_full_account::<Size1Struct>() };
+        let (acc1, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
         assert_eq!(acc1.data().len(), 1);
         assert_eq!(acc1.data()[0], 0xAA);
 
-        let (acc7, iterator) = unsafe { iterator.typed_known_next_full_account::<Size7Struct>() };
+        let (acc7, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
         assert_eq!(acc7.data().len(), 7);
         assert_eq!(acc7.data(), &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
 
-        let (acc5, iterator) = unsafe { iterator.typed_known_next_full_account::<Size5Struct>() };
+        let (acc5, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size5Struct>() };
         assert_eq!(acc5.data().len(), 5);
         assert_eq!(acc5.data(), &[0x10, 0x20, 0x30, 0x40, 0x50]);
 
