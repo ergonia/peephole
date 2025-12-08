@@ -177,6 +177,7 @@ impl<T> Slurper for TypedSlurper<T> {
         unsafe {
             assume!(known_size == *size_in_data, "Known size is not real size");
         }
+
         known_size as u64
     }
 
@@ -192,7 +193,18 @@ impl<T> Slurper for TypedSlurper<T> {
             const fn adjustment<F>() -> usize {
                 BPF_ALIGN_OF_U128 - core::mem::size_of::<F>() % BPF_ALIGN_OF_U128
             }
-            unsafe { ptr.add(adjustment::<T>()) }
+            let fast_next = unsafe { ptr.add(adjustment::<T>()) };
+
+            #[cfg(debug_assertions)]
+            {
+                let true_next = unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) };
+                assert_eq!(
+                    fast_next, true_next,
+                    "TypedSlurper next pointer miscalculated"
+                );
+            }
+
+            fast_next
         }
     }
 }
@@ -454,6 +466,10 @@ impl AccountIterator {
         let next = next.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
         let next = S::get_next_pointer(next);
+        assume!(
+            next.align_offset(BPF_ALIGN_OF_U128) == 0,
+            "Next account pointer not 8-byte aligned"
+        );
 
         let (rent_epoch, next) = slurp::<u64>(next);
 
@@ -883,6 +899,10 @@ pub mod arbitrary_impls {
     #[repr(transparent)]
     pub struct Size15Struct(pub [u8; 15]); // mod 8 = 7, just under 16
 
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size13Struct(pub [u8; 13]); // mod 8 = 5
+
     pub fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
         let data_bytes = unsafe {
             std::slice::from_raw_parts(data as *const _ as *const u8, std::mem::size_of::<T>())
@@ -963,6 +983,34 @@ pub mod arbitrary_impls {
         }
     }
 
+    #[cfg(test)]
+    impl Arbitrary for Size1Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self([u8::arbitrary(g)])
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for Size2Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self([u8::arbitrary(g), u8::arbitrary(g)])
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for Size7Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self(std::array::from_fn(|_| u8::arbitrary(g)))
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for Size13Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self(std::array::from_fn(|_| u8::arbitrary(g)))
+        }
+    }
+
     #[derive(Debug, Clone)]
     #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     pub enum TestAccountType {
@@ -975,6 +1023,16 @@ pub mod arbitrary_impls {
         /// Duplicate of a previous account. The u8 is a hint that will be
         /// taken modulo the number of real accounts seen so far.
         Duplicate(u8),
+        /// Test like_type_known_next_full_account with 1-byte data (mod 8 = 1)
+        LikeTypeSize1(Size1Struct, TestAccountMeta),
+        /// Test like_type_known_next_full_account with 2-byte data (mod 8 = 2)
+        LikeTypeSize2(Size2Struct, TestAccountMeta),
+        /// Test like_type_known_next_full_account with 7-byte data (mod 8 = 7)
+        LikeTypeSize7(Size7Struct, TestAccountMeta),
+        /// Test like_type_known_next_full_account with 13-byte data (mod 8 = 5)
+        LikeTypeSize13(Size13Struct, TestAccountMeta),
+        /// Test aligned_known_next_full_account with 8-byte aligned data
+        AlignedKnown(Vec<u8>, TestAccountMeta),
     }
 
     #[cfg(test)]
@@ -989,7 +1047,7 @@ pub mod arbitrary_impls {
                     TestAccountMeta::arbitrary(g),
                 )
             }
-            match u8::arbitrary(g) % 8 {
+            match u8::arbitrary(g) % 13 {
                 0 => TestAccountType::Aligned(
                     QuickCheckAligned {
                         a: u64::arbitrary(g),
@@ -1019,7 +1077,32 @@ pub mod arbitrary_impls {
                 }
                 4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
                 5 => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
-                // ~25% chance of generating a duplicate (2 out of 8 cases)
+                // like_type_known_next_full_account variants with various alignment remainders
+                6 => TestAccountType::LikeTypeSize1(
+                    Size1Struct::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
+                ),
+                7 => TestAccountType::LikeTypeSize2(
+                    Size2Struct::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
+                ),
+                8 => TestAccountType::LikeTypeSize7(
+                    Size7Struct::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
+                ),
+                9 => TestAccountType::LikeTypeSize13(
+                    Size13Struct::arbitrary(g),
+                    TestAccountMeta::arbitrary(g),
+                ),
+                // aligned_known_next_full_account with 8-byte aligned data
+                10 => {
+                    // Generate 8-byte aligned data (8, 16, 24, or 32 bytes)
+                    let aligned_sizes = [8, 16, 24, 32];
+                    let len = aligned_sizes[usize::arbitrary(g) % aligned_sizes.len()];
+                    let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
+                    TestAccountType::AlignedKnown(data, TestAccountMeta::arbitrary(g))
+                }
+                // ~15% chance of generating a duplicate (2 out of 13 cases)
                 _ => TestAccountType::Duplicate(u8::arbitrary(g)),
             }
         }
@@ -1066,6 +1149,30 @@ pub mod arbitrary_impls {
                 .collect(),
             // Duplicates are handled separately in create_test_accounts_from_types
             TestAccountType::Duplicate(_) => vec![],
+            TestAccountType::LikeTypeSize1(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::LikeTypeSize2(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::LikeTypeSize7(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::LikeTypeSize13(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::AlignedKnown(data, meta) => {
+                let (acc, data) = create_test_account_with_meta(&meta, data.clone());
+                vec![(acc, data, meta.rent_epoch)]
+            }
         }
     }
 
@@ -1158,8 +1265,9 @@ pub mod arbitrary_impls {
                     iterator = next;
                 }
                 TestAccountType::Unaligned(un, meta) => {
-                    let (acc, next) =
-                        unsafe { iterator.like_type_known_next_full_account::<QuickCheckUnaligned>() };
+                    let (acc, next) = unsafe {
+                        iterator.like_type_known_next_full_account::<QuickCheckUnaligned>()
+                    };
                     if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
                     {
                         return false;
@@ -1294,6 +1402,135 @@ pub mod arbitrary_impls {
                 TestAccountType::Duplicate(_) => {
                     // Duplicates are filtered out before this loop, so this is unreachable
                     unreachable!("Duplicate variants should have been filtered out")
+                }
+                TestAccountType::LikeTypeSize1(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size1Struct>() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
+                        return false;
+                    }
+                    if acc.data() != expected.0.as_slice() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::LikeTypeSize2(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size2Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size2Struct>() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
+                        return false;
+                    }
+                    if acc.data() != expected.0.as_slice() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::LikeTypeSize7(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size7Struct>() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
+                        return false;
+                    }
+                    if acc.data() != expected.0.as_slice() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::LikeTypeSize13(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size13Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size13Struct>() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
+                        return false;
+                    }
+                    if acc.data() != expected.0.as_slice() {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::AlignedKnown(expected_data, meta) => {
+                    let (acc, next) = unsafe { iterator.aligned_known_next_full_account() };
+                    if acc.static_data.data_len != expected_data.len() as u64 {
+                        return false;
+                    }
+                    if (acc.static_data.is_signer == 1) != meta.is_signer {
+                        return false;
+                    }
+                    if (acc.static_data.is_writable == 1) != meta.is_writable {
+                        return false;
+                    }
+                    if (acc.static_data.executable == 1) != meta.executable {
+                        return false;
+                    }
+                    if acc.static_data.lamports != meta.lamports {
+                        return false;
+                    }
+                    if *acc.rent_epoch != meta.rent_epoch {
+                        return false;
+                    }
+                    if acc.data() != expected_data.as_slice() {
+                        return false;
+                    }
+                    iterator = next;
                 }
             }
         }
@@ -2027,15 +2264,18 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        let (acc1, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
+        let (acc1, iterator) =
+            unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
         assert_eq!(acc1.data().len(), 1);
         assert_eq!(acc1.data()[0], 0xAA);
 
-        let (acc7, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
+        let (acc7, iterator) =
+            unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
         assert_eq!(acc7.data().len(), 7);
         assert_eq!(acc7.data(), &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
 
-        let (acc5, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size5Struct>() };
+        let (acc5, iterator) =
+            unsafe { iterator.like_type_known_next_full_account::<Size5Struct>() };
         assert_eq!(acc5.data().len(), 5);
         assert_eq!(acc5.data(), &[0x10, 0x20, 0x30, 0x40, 0x50]);
 
