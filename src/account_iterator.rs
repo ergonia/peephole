@@ -185,7 +185,14 @@ impl<T> Slurper for TypedSlurper<T> {
         if core::mem::size_of::<T>() % BPF_ALIGN_OF_U128 == 0 || core::mem::size_of::<T>() == 0 {
             ptr
         } else {
-            unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) }
+            // the original base ptr is 8 byte aligned
+            // the MAX_PERMITTED_DATA_INCREASE is multiple of 8 bytes
+            // so we just need to add std::mem::size_of::<T>() % BPF_ALIGN_OF_U128
+            // has to be a new function b/c i can't use generics in the const
+            const fn adjustment<F>() -> usize {
+                BPF_ALIGN_OF_U128 - core::mem::size_of::<F>() % BPF_ALIGN_OF_U128
+            }
+            unsafe { ptr.add(adjustment::<T>()) }
         }
     }
 }
@@ -262,9 +269,7 @@ impl AccountIterator {
     pub unsafe fn known_next_full_account(self) -> (NonDupAccount<'static>, AccountIterator) {
         debug_assert!(self.remaining_accounts > 0);
 
-        let is_dup = unsafe { &*self.base_ptr };
-
-        debug_assert_eq!(*is_dup, NON_DUP_MARKER);
+        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
 
         let (account, next) = self.slurp_real_account::<Dynamic>();
 
@@ -286,9 +291,7 @@ impl AccountIterator {
     ) -> (NonDupAccount<'static>, AccountIterator) {
         debug_assert!(self.remaining_accounts > 0);
 
-        let is_dup = unsafe { &*self.base_ptr };
-
-        debug_assert_eq!(*is_dup, NON_DUP_MARKER);
+        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
 
         let (account, next) = self.slurp_real_account::<Aligned>();
 
@@ -315,9 +318,7 @@ impl AccountIterator {
     ) -> (NonDupAccount<'static>, AccountIterator) {
         debug_assert!(self.remaining_accounts > 0);
 
-        let is_dup = unsafe { &*self.base_ptr };
-
-        debug_assert_eq!(*is_dup, NON_DUP_MARKER);
+        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
 
         let (account, next) = self.slurp_real_account::<TypedSlurper<T>>();
 
@@ -442,9 +443,15 @@ impl AccountIterator {
     unsafe fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
         let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
         let data_len = S::get_account_size(&account_static.data_len);
+
+        debug_assert_eq!(
+            data_len as usize, account_static.data_len as usize,
+            "Account data length does not match expected size"
+        );
+
         let data = core::slice::from_raw_parts_mut(next, data_len as usize);
 
-        let next = next.add(account_static.data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = next.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
         let next = S::get_next_pointer(next);
 
@@ -532,9 +539,8 @@ impl AccountIterator {
         let data = unsafe {
             core::slice::from_raw_parts_mut(instruction_data, *instruction_length as usize)
         };
-        let program_id = unsafe {
-            &*(instruction_data.add(*instruction_length as usize) as *const Pubkey)
-        };
+        let program_id =
+            unsafe { &*(instruction_data.add(*instruction_length as usize) as *const Pubkey) };
         (data, program_id)
     }
 
@@ -815,7 +821,8 @@ pub mod arbitrary_impls {
                 TestAccount::Duplicate(idx) => TestAccount::Duplicate(idx),
             })
             .collect();
-        let (instruction, _program_id) = create_test_instruction(accounts_with_rent, instruction_data);
+        let (instruction, _program_id) =
+            create_test_instruction(accounts_with_rent, instruction_data);
         instruction
     }
 
@@ -842,6 +849,39 @@ pub mod arbitrary_impls {
     #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct EmptyStruct {} // Zero-sized
+
+    // Test structs covering all size mod 8 remainders for alignment optimization testing
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size1Struct(pub [u8; 1]); // mod 8 = 1
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size2Struct(pub [u8; 2]); // mod 8 = 2
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size4Struct(pub [u8; 4]); // mod 8 = 4
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size5Struct(pub [u8; 5]); // mod 8 = 5
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size6Struct(pub [u8; 6]); // mod 8 = 6
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size7Struct(pub [u8; 7]); // mod 8 = 7
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size9Struct(pub [u8; 9]); // mod 8 = 1, just over 8
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Size15Struct(pub [u8; 15]); // mod 8 = 7, just under 16
 
     pub fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
         let data_bytes = unsafe {
@@ -964,10 +1004,7 @@ pub mod arbitrary_impls {
                     },
                     TestAccountMeta::arbitrary(g),
                 ),
-                2 => TestAccountType::Empty(
-                    QuickCheckEmpty {},
-                    TestAccountMeta::arbitrary(g),
-                ),
+                2 => TestAccountType::Empty(QuickCheckEmpty {}, TestAccountMeta::arbitrary(g)),
                 3 => {
                     // Generate data with sizes that test alignment edge cases
                     let alignment_edge_sizes = [0, 1, 7, 8, 9, 15, 16, 17, 31, 32];
@@ -1491,7 +1528,10 @@ mod tests {
 
         let test_cases = vec![
             (vec![], vec![1, 2, 3, 4]),
-            (vec![TestAccount::Real(account1, data1.clone(), 0)], vec![5, 6]),
+            (
+                vec![TestAccount::Real(account1, data1.clone(), 0)],
+                vec![5, 6],
+            ),
             (
                 vec![
                     TestAccount::Real(account1, data1.clone(), 0),
@@ -1598,7 +1638,10 @@ mod tests {
     fn test_dup_account() {
         let (account, data) = create_test_account(false, false, vec![1, 2, 3, 4]);
         let (mut instruction, _program_id) = create_test_instruction(
-            vec![TestAccount::Duplicate(0), TestAccount::Real(account, data, 0)],
+            vec![
+                TestAccount::Duplicate(0),
+                TestAccount::Real(account, data, 0),
+            ],
             vec![],
         );
 
@@ -1863,6 +1906,145 @@ mod tests {
         assert_eq!(acc.data().len(), std::mem::size_of::<EmptyStruct>());
     }
 
+    // Tests for all mod 8 size remainders to verify alignment optimization
+    #[test]
+    fn test_typed_known_next_full_account_size1() {
+        let data = Size1Struct([0x42]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size1Struct>() };
+
+        assert_eq!(acc.data().len(), 1);
+        assert_eq!(acc.data()[0], 0x42);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size2() {
+        let data = Size2Struct([0x12, 0x34]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size2Struct>() };
+
+        assert_eq!(acc.data().len(), 2);
+        assert_eq!(acc.data(), &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size4() {
+        let data = Size4Struct([0x11, 0x22, 0x33, 0x44]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size4Struct>() };
+
+        assert_eq!(acc.data().len(), 4);
+        assert_eq!(acc.data(), &[0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size5() {
+        let data = Size5Struct([0x01, 0x02, 0x03, 0x04, 0x05]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size5Struct>() };
+
+        assert_eq!(acc.data().len(), 5);
+        assert_eq!(acc.data(), &[0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size6() {
+        let data = Size6Struct([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size6Struct>() };
+
+        assert_eq!(acc.data().len(), 6);
+        assert_eq!(acc.data(), &[0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size7() {
+        let data = Size7Struct([0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size7Struct>() };
+
+        assert_eq!(acc.data().len(), 7);
+        assert_eq!(acc.data(), &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size9() {
+        let data = Size9Struct([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size9Struct>() };
+
+        assert_eq!(acc.data().len(), 9);
+        assert_eq!(
+            acc.data(),
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+        );
+    }
+
+    #[test]
+    fn test_typed_known_next_full_account_size15() {
+        let data = Size15Struct([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let mut instruction = create_typed_test_instruction(&data);
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let (acc, _) = unsafe { iterator.typed_known_next_full_account::<Size15Struct>() };
+
+        assert_eq!(acc.data().len(), 15);
+        assert_eq!(
+            acc.data(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    // Test multiple accounts with different sizes to verify pointer advancement
+    #[test]
+    fn test_typed_known_next_full_account_mixed_sizes() {
+        let data1 = Size1Struct([0xAA]);
+        let data7 = Size7Struct([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        let data5 = Size5Struct([0x10, 0x20, 0x30, 0x40, 0x50]);
+
+        let data1_bytes = data1.0.to_vec();
+        let data7_bytes = data7.0.to_vec();
+        let data5_bytes = data5.0.to_vec();
+
+        let (account1, _) = create_test_account(true, true, data1_bytes.clone());
+        let (account7, _) = create_test_account(true, true, data7_bytes.clone());
+        let (account5, _) = create_test_account(true, true, data5_bytes.clone());
+
+        let (mut instruction, _) = create_test_instruction(
+            vec![
+                TestAccount::Real(account1, data1_bytes, 0),
+                TestAccount::Real(account7, data7_bytes, 0),
+                TestAccount::Real(account5, data5_bytes, 0),
+            ],
+            vec![0xDE, 0xAD],
+        );
+
+        let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        let (acc1, iterator) = unsafe { iterator.typed_known_next_full_account::<Size1Struct>() };
+        assert_eq!(acc1.data().len(), 1);
+        assert_eq!(acc1.data()[0], 0xAA);
+
+        let (acc7, iterator) = unsafe { iterator.typed_known_next_full_account::<Size7Struct>() };
+        assert_eq!(acc7.data().len(), 7);
+        assert_eq!(acc7.data(), &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+
+        let (acc5, iterator) = unsafe { iterator.typed_known_next_full_account::<Size5Struct>() };
+        assert_eq!(acc5.data().len(), 5);
+        assert_eq!(acc5.data(), &[0x10, 0x20, 0x30, 0x40, 0x50]);
+
+        // Verify we can still read instruction data and program address
+        let (instr_data, _program_id) =
+            unsafe { iterator.known_instruction_data_and_program_address() };
+        assert_eq!(instr_data, &[0xDE, 0xAD]);
+    }
+
     #[quickcheck_macros::quickcheck]
     fn quickcheck_mixed_account_types_with_arrays(
         account_types: Vec<TestAccountType>,
@@ -1941,8 +2123,10 @@ mod tests {
         // Test with 8-byte aligned data (multiple of 8)
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 8 bytes - aligned
         let (account, _) = create_test_account(true, false, data.clone());
-        let (mut instruction, _program_id) =
-            create_test_instruction(vec![TestAccount::Real(account, data.clone(), 0)], vec![9, 10]);
+        let (mut instruction, _program_id) = create_test_instruction(
+            vec![TestAccount::Real(account, data.clone(), 0)],
+            vec![9, 10],
+        );
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, next_iter) = unsafe { iterator.aligned_known_next_full_account() };
@@ -2009,7 +2193,8 @@ mod tests {
     #[test]
     fn test_known_instruction_data_no_accounts() {
         let instruction_data = vec![100, 200, 255, 0, 1];
-        let (mut instruction, _program_id) = create_test_instruction(vec![], instruction_data.clone());
+        let (mut instruction, _program_id) =
+            create_test_instruction(vec![], instruction_data.clone());
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
@@ -2105,13 +2290,15 @@ mod tests {
         // Test with exactly 256 accounts (the maximum supported)
         let accounts: Vec<TestAccount> = (0..256)
             .map(|i| {
-                let (acc, data) = create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
+                let (acc, data) =
+                    create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
                 TestAccount::Real(acc, data, 0)
             })
             .collect();
 
         let instruction_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let (mut instruction, _program_id) = create_test_instruction(accounts, instruction_data.clone());
+        let (mut instruction, _program_id) =
+            create_test_instruction(accounts, instruction_data.clone());
 
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
@@ -2395,8 +2582,7 @@ mod tests {
                 NextAccount::Data(data, program_id) => {
                     assert_eq!(data.len(), len);
                     assert_eq!(
-                        *program_id,
-                        expected_program_id,
+                        *program_id, expected_program_id,
                         "Program address mismatch for instruction_data len={}",
                         len
                     );
@@ -2489,8 +2675,10 @@ mod tests {
         // Test with account data near MAX_PERMITTED_DATA_INCREASE size
         let large_data: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
         let (account, _) = create_test_account(true, true, large_data.clone());
-        let (mut instruction, _program_id) =
-            create_test_instruction(vec![TestAccount::Real(account, large_data.clone(), 0)], vec![42]);
+        let (mut instruction, _program_id) = create_test_instruction(
+            vec![TestAccount::Real(account, large_data.clone(), 0)],
+            vec![42],
+        );
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let (acc, next_iter) = unsafe { iterator.known_next_full_account() };
@@ -2528,7 +2716,10 @@ mod tests {
         assert_eq!(typed_acc.data.field_a, 0xDEADBEEF);
         assert_eq!(typed_acc.data.field_b, 0xCAFEBABE);
         assert_eq!(typed_acc.data.field_c, 0x12345678);
-        assert_eq!(typed_acc.static_data.data_len, std::mem::size_of::<MyAccount>() as u64);
+        assert_eq!(
+            typed_acc.static_data.data_len,
+            std::mem::size_of::<MyAccount>() as u64
+        );
 
         // Should be able to get instruction data after
         assert_eq!(next_iter.remaining_accounts(), 0);
@@ -2633,7 +2824,8 @@ mod tests {
         // Create 255 real accounts, then a dup with index 254
         let mut accounts: Vec<TestAccount> = (0..255)
             .map(|i| {
-                let (acc, data) = create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
+                let (acc, data) =
+                    create_test_account(i % 2 == 0, i % 3 == 0, vec![(i & 0xFF) as u8]);
                 TestAccount::Real(acc, data, 0)
             })
             .collect();
@@ -2732,7 +2924,9 @@ mod tests {
     #[test]
     fn test_instruction_data_edge_sizes() {
         // Test instruction data at various edge sizes
-        let edge_sizes = [0, 1, 7, 8, 9, 15, 16, 17, 127, 128, 255, 256, 1023, 1024, 4095, 4096];
+        let edge_sizes = [
+            0, 1, 7, 8, 9, 15, 16, 17, 127, 128, 255, 256, 1023, 1024, 4095, 4096,
+        ];
 
         for size in edge_sizes {
             let instruction_data: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
@@ -2799,6 +2993,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "known_program_address called with")]
     fn test_known_program_address_panics_with_remaining_accounts() {
         // Debug assertion: calling known_program_address before consuming all accounts should panic
@@ -2813,6 +3008,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "known_instruction_data_and_program_address called with")]
     fn test_known_instruction_data_and_program_address_panics_with_remaining_accounts() {
         // Debug assertion: calling known_instruction_data_and_program_address before consuming all accounts should panic

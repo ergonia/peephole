@@ -50,7 +50,11 @@ mod solana {
     #[cfg(any(test, feature = "std"))]
     pub fn easy_deserialize<'a>(
         inputs: *mut u8,
-    ) -> (pubkey::Pubkey, std::vec::Vec<account_info::AccountInfo<'a>>, std::vec::Vec<u8>) {
+    ) -> (
+        pubkey::Pubkey,
+        std::vec::Vec<account_info::AccountInfo<'a>>,
+        std::vec::Vec<u8>,
+    ) {
         let (program_id, accounts, instruction_data) = unsafe { entrypoint::deserialize(inputs) };
 
         (*program_id, accounts, instruction_data.to_vec())
@@ -132,7 +136,11 @@ mod solana {
     #[cfg(any(test, feature = "std"))]
     pub fn easy_deserialize(
         inputs: *mut u8,
-    ) -> (pubkey::Pubkey, std::vec::Vec<account_info::AccountInfo>, std::vec::Vec<u8>) {
+    ) -> (
+        pubkey::Pubkey,
+        std::vec::Vec<account_info::AccountInfo>,
+        std::vec::Vec<u8>,
+    ) {
         use std::mem::MaybeUninit;
 
         let mut the_uninit = std::vec::Vec::new();
