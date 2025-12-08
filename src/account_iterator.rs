@@ -177,6 +177,7 @@ impl<T> Slurper for TypedSlurper<T> {
         unsafe {
             assume!(known_size == *size_in_data, "Known size is not real size");
         }
+
         known_size as u64
     }
 
@@ -192,7 +193,18 @@ impl<T> Slurper for TypedSlurper<T> {
             const fn adjustment<F>() -> usize {
                 BPF_ALIGN_OF_U128 - core::mem::size_of::<F>() % BPF_ALIGN_OF_U128
             }
-            unsafe { ptr.add(adjustment::<T>()) }
+            let fast_next = unsafe { ptr.add(adjustment::<T>()) };
+
+            #[cfg(debug_assertions)]
+            {
+                let true_next = unsafe { ptr.add(ptr.align_offset(BPF_ALIGN_OF_U128)) };
+                assert_eq!(
+                    fast_next, true_next,
+                    "TypedSlurper next pointer miscalculated"
+                );
+            }
+
+            fast_next
         }
     }
 }
@@ -454,6 +466,10 @@ impl AccountIterator {
         let next = next.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
 
         let next = S::get_next_pointer(next);
+        assume!(
+            next.align_offset(BPF_ALIGN_OF_U128) == 0,
+            "Next account pointer not 8-byte aligned"
+        );
 
         let (rent_epoch, next) = slurp::<u64>(next);
 
@@ -852,36 +868,49 @@ pub mod arbitrary_impls {
 
     // Test structs covering all size mod 8 remainders for alignment optimization testing
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size1Struct(pub [u8; 1]); // mod 8 = 1
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size2Struct(pub [u8; 2]); // mod 8 = 2
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size4Struct(pub [u8; 4]); // mod 8 = 4
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size5Struct(pub [u8; 5]); // mod 8 = 5
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size6Struct(pub [u8; 6]); // mod 8 = 6
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size7Struct(pub [u8; 7]); // mod 8 = 7
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size9Struct(pub [u8; 9]); // mod 8 = 1, just over 8
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(transparent)]
     pub struct Size15Struct(pub [u8; 15]); // mod 8 = 7, just under 16
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
+    #[repr(transparent)]
+    pub struct Size13Struct(pub [u8; 13]); // mod 8 = 5
 
     pub fn create_typed_test_instruction<T: Copy>(data: &T) -> Vec<u8> {
         let data_bytes = unsafe {
@@ -895,7 +924,6 @@ pub mod arbitrary_impls {
         instruction
     }
     #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq, Eq)]
-    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct QuickCheckAligned {
         pub a: u64,
@@ -903,7 +931,6 @@ pub mod arbitrary_impls {
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct QuickCheckUnaligned {
         pub a: u16,
@@ -922,13 +949,11 @@ pub mod arbitrary_impls {
     }
 
     #[derive(Debug, Copy, Clone)]
-    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     #[repr(C)]
     pub struct QuickCheckEmpty {}
 
     /// Metadata for a test account - all the fuzzable properties
     #[derive(Debug, Clone, Copy)]
-    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     pub struct TestAccountMeta {
         pub is_signer: bool,
         pub is_writable: bool,
@@ -951,20 +976,122 @@ pub mod arbitrary_impls {
     }
 
     #[cfg(test)]
-    impl Arbitrary for TestAccountMeta {
+    impl Arbitrary for Size1Struct {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            Self {
-                is_signer: bool::arbitrary(g),
-                is_writable: bool::arbitrary(g),
-                executable: bool::arbitrary(g),
-                lamports: u64::arbitrary(g),
-                rent_epoch: u64::arbitrary(g),
-            }
+            Self([u8::arbitrary(g)])
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for Size2Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self([u8::arbitrary(g), u8::arbitrary(g)])
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for Size7Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self(std::array::from_fn(|_| u8::arbitrary(g)))
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for Size13Struct {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self(std::array::from_fn(|_| u8::arbitrary(g)))
+        }
+    }
+
+    // ============================================================================
+    // Unified random generation for quickcheck and cargo-fuzz
+    // ============================================================================
+    //
+    // Problem: quickcheck uses `quickcheck::Arbitrary` trait, cargo-fuzz uses
+    // `arbitrary::Arbitrary` trait. Both have different APIs:
+    //   - quickcheck: `fn arbitrary(g: &mut Gen) -> Self` (infallible)
+    //   - arbitrary: `fn arbitrary(u: &mut Unstructured) -> Result<Self>` (fallible)
+    //
+    // Solution: Define a `RandomSource` trait that abstracts over both, returning
+    // `Result<T, Self::Error>`. For quickcheck, Error = Infallible (never type).
+    // ============================================================================
+
+    /// Trait abstracting over quickcheck::Gen and arbitrary::Unstructured.
+    /// Allows sharing random generation logic between test and fuzz targets.
+    #[cfg(any(test, fuzzing))]
+    trait RandomSource {
+        type Error;
+
+        fn gen_u8(&mut self) -> Result<u8, Self::Error>;
+        fn gen_u16(&mut self) -> Result<u16, Self::Error>;
+        fn gen_u64(&mut self) -> Result<u64, Self::Error>;
+        fn gen_bool(&mut self) -> Result<bool, Self::Error>;
+        fn gen_usize(&mut self) -> Result<usize, Self::Error>;
+        fn gen_bytes(&mut self, len: usize) -> Result<Vec<u8>, Self::Error>;
+        fn gen_u64_vec(&mut self, len: usize) -> Result<Vec<u64>, Self::Error>;
+    }
+
+    #[cfg(test)]
+    struct QuickCheckSource<'a>(&'a mut quickcheck::Gen);
+
+    #[cfg(test)]
+    impl RandomSource for QuickCheckSource<'_> {
+        type Error = std::convert::Infallible;
+
+        fn gen_u8(&mut self) -> Result<u8, Self::Error> {
+            Ok(u8::arbitrary(self.0))
+        }
+        fn gen_u16(&mut self) -> Result<u16, Self::Error> {
+            Ok(u16::arbitrary(self.0))
+        }
+        fn gen_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(u64::arbitrary(self.0))
+        }
+        fn gen_bool(&mut self) -> Result<bool, Self::Error> {
+            Ok(bool::arbitrary(self.0))
+        }
+        fn gen_usize(&mut self) -> Result<usize, Self::Error> {
+            Ok(usize::arbitrary(self.0))
+        }
+        fn gen_bytes(&mut self, len: usize) -> Result<Vec<u8>, Self::Error> {
+            Ok((0..len).map(|_| u8::arbitrary(self.0)).collect())
+        }
+        fn gen_u64_vec(&mut self, len: usize) -> Result<Vec<u64>, Self::Error> {
+            Ok((0..len).map(|_| u64::arbitrary(self.0)).collect())
+        }
+    }
+
+    #[cfg(fuzzing)]
+    struct ArbitrarySource<'a, 'b>(&'a mut arbitrary::Unstructured<'b>);
+
+    #[cfg(fuzzing)]
+    impl RandomSource for ArbitrarySource<'_, '_> {
+        type Error = arbitrary::Error;
+
+        fn gen_u8(&mut self) -> Result<u8, Self::Error> {
+            self.0.arbitrary()
+        }
+        fn gen_u16(&mut self) -> Result<u16, Self::Error> {
+            self.0.arbitrary()
+        }
+        fn gen_u64(&mut self) -> Result<u64, Self::Error> {
+            self.0.arbitrary()
+        }
+        fn gen_bool(&mut self) -> Result<bool, Self::Error> {
+            self.0.arbitrary()
+        }
+        fn gen_usize(&mut self) -> Result<usize, Self::Error> {
+            self.0.arbitrary()
+        }
+        fn gen_bytes(&mut self, len: usize) -> Result<Vec<u8>, Self::Error> {
+            (0..len).map(|_| self.0.arbitrary()).collect()
+        }
+        fn gen_u64_vec(&mut self, len: usize) -> Result<Vec<u64>, Self::Error> {
+            (0..len).map(|_| self.0.arbitrary()).collect()
         }
     }
 
     #[derive(Debug, Clone)]
-    #[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
     pub enum TestAccountType {
         Aligned(QuickCheckAligned, TestAccountMeta),
         Unaligned(QuickCheckUnaligned, TestAccountMeta),
@@ -975,53 +1102,149 @@ pub mod arbitrary_impls {
         /// Duplicate of a previous account. The u8 is a hint that will be
         /// taken modulo the number of real accounts seen so far.
         Duplicate(u8),
+        /// Test like_type_known_next_full_account with 1-byte data (mod 8 = 1)
+        LikeTypeSize1(Size1Struct, TestAccountMeta),
+        /// Test like_type_known_next_full_account with 2-byte data (mod 8 = 2)
+        LikeTypeSize2(Size2Struct, TestAccountMeta),
+        /// Test like_type_known_next_full_account with 7-byte data (mod 8 = 7)
+        LikeTypeSize7(Size7Struct, TestAccountMeta),
+        /// Test like_type_known_next_full_account with 13-byte data (mod 8 = 5)
+        LikeTypeSize13(Size13Struct, TestAccountMeta),
+        /// Test aligned_known_next_full_account with 8-byte aligned data.
+        /// Uses Vec<u64> to guarantee 8-byte aligned length - flattened to bytes when creating account.
+        AlignedKnown(Vec<u64>, TestAccountMeta),
+    }
+
+    /// Shared generation logic for TestAccountType.
+    /// Used by both quickcheck and arbitrary implementations.
+    #[cfg(any(test, fuzzing))]
+    impl TestAccountType {
+        fn generate<R: RandomSource>(rng: &mut R) -> Result<Self, R::Error> {
+            let variant = rng.gen_u8()? % 13;
+            match variant {
+                0 => {
+                    let a = rng.gen_u64()?;
+                    let b = rng.gen_u64()?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::Aligned(QuickCheckAligned { a, b }, meta))
+                }
+                1 => {
+                    let a = rng.gen_u16()?;
+                    let b = rng.gen_u8()?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::Unaligned(QuickCheckUnaligned { a, b }, meta))
+                }
+                2 => {
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::Empty(QuickCheckEmpty {}, meta))
+                }
+                3 => {
+                    let len = rng.gen_usize()? % 64;
+                    let data = rng.gen_bytes(len)?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::Untyped(data, meta))
+                }
+                4 => {
+                    let p1 = Self::generate_aligned_pair(rng)?;
+                    let p2 = Self::generate_aligned_pair(rng)?;
+                    Ok(TestAccountType::AlignedArray([p1, p2]))
+                }
+                5 => {
+                    let p1 = Self::generate_aligned_pair(rng)?;
+                    let p2 = Self::generate_aligned_pair(rng)?;
+                    let p3 = Self::generate_aligned_pair(rng)?;
+                    Ok(TestAccountType::AlignedArray3([p1, p2, p3]))
+                }
+                6 => {
+                    let b = rng.gen_u8()?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::LikeTypeSize1(Size1Struct([b]), meta))
+                }
+                7 => {
+                    let b1 = rng.gen_u8()?;
+                    let b2 = rng.gen_u8()?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::LikeTypeSize2(Size2Struct([b1, b2]), meta))
+                }
+                8 => {
+                    let bytes = rng.gen_bytes(7)?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    let arr: [u8; 7] = bytes.try_into().unwrap();
+                    Ok(TestAccountType::LikeTypeSize7(Size7Struct(arr), meta))
+                }
+                9 => {
+                    let bytes = rng.gen_bytes(13)?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    let arr: [u8; 13] = bytes.try_into().unwrap();
+                    Ok(TestAccountType::LikeTypeSize13(Size13Struct(arr), meta))
+                }
+                10 => {
+                    let len = (rng.gen_usize()? % 4) + 1; // 1-4 u64s = 8-32 bytes
+                    let data = rng.gen_u64_vec(len)?;
+                    let meta = TestAccountMeta::generate(rng)?;
+                    Ok(TestAccountType::AlignedKnown(data, meta))
+                }
+                // Remaining cases: Duplicate (~15% chance)
+                _ => {
+                    let hint = rng.gen_u8()?;
+                    Ok(TestAccountType::Duplicate(hint))
+                }
+            }
+        }
+
+        fn generate_aligned_pair<R: RandomSource>(
+            rng: &mut R,
+        ) -> Result<(QuickCheckAligned, TestAccountMeta), R::Error> {
+            let a = rng.gen_u64()?;
+            let b = rng.gen_u64()?;
+            let meta = TestAccountMeta::generate(rng)?;
+            Ok((QuickCheckAligned { a, b }, meta))
+        }
+    }
+
+    #[cfg(any(test, fuzzing))]
+    impl TestAccountMeta {
+        fn generate<R: RandomSource>(rng: &mut R) -> Result<Self, R::Error> {
+            Ok(TestAccountMeta {
+                is_signer: rng.gen_bool()?,
+                is_writable: rng.gen_bool()?,
+                executable: rng.gen_bool()?,
+                lamports: rng.gen_u64()?,
+                rent_epoch: rng.gen_u64()?,
+            })
+        }
     }
 
     #[cfg(test)]
     impl Arbitrary for TestAccountType {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            fn aligned(g: &mut quickcheck::Gen) -> (QuickCheckAligned, TestAccountMeta) {
-                (
-                    QuickCheckAligned {
-                        a: u64::arbitrary(g),
-                        b: u64::arbitrary(g),
-                    },
-                    TestAccountMeta::arbitrary(g),
-                )
-            }
-            match u8::arbitrary(g) % 8 {
-                0 => TestAccountType::Aligned(
-                    QuickCheckAligned {
-                        a: u64::arbitrary(g),
-                        b: u64::arbitrary(g),
-                    },
-                    TestAccountMeta::arbitrary(g),
-                ),
-                1 => TestAccountType::Unaligned(
-                    QuickCheckUnaligned {
-                        a: u16::arbitrary(g),
-                        b: u8::arbitrary(g),
-                    },
-                    TestAccountMeta::arbitrary(g),
-                ),
-                2 => TestAccountType::Empty(QuickCheckEmpty {}, TestAccountMeta::arbitrary(g)),
-                3 => {
-                    // Generate data with sizes that test alignment edge cases
-                    let alignment_edge_sizes = [0, 1, 7, 8, 9, 15, 16, 17, 31, 32];
-                    let len = if bool::arbitrary(g) {
-                        // 50% chance of alignment edge case size
-                        alignment_edge_sizes[usize::arbitrary(g) % alignment_edge_sizes.len()]
-                    } else {
-                        usize::arbitrary(g) % 64
-                    };
-                    let data: Vec<u8> = (0..len).map(|_| u8::arbitrary(g)).collect();
-                    TestAccountType::Untyped(data, TestAccountMeta::arbitrary(g))
-                }
-                4 => TestAccountType::AlignedArray([aligned(g), aligned(g)]),
-                5 => TestAccountType::AlignedArray3([aligned(g), aligned(g), aligned(g)]),
-                // ~25% chance of generating a duplicate (2 out of 8 cases)
-                _ => TestAccountType::Duplicate(u8::arbitrary(g)),
-            }
+            let mut source = QuickCheckSource(g);
+            // Infallible can never happen, so unwrap is safe
+            TestAccountType::generate(&mut source).unwrap()
+        }
+    }
+
+    #[cfg(fuzzing)]
+    impl<'a> arbitrary::Arbitrary<'a> for TestAccountType {
+        fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+            let mut source = ArbitrarySource(u);
+            TestAccountType::generate(&mut source)
+        }
+    }
+
+    #[cfg(test)]
+    impl Arbitrary for TestAccountMeta {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            let mut source = QuickCheckSource(g);
+            TestAccountMeta::generate(&mut source).unwrap()
+        }
+    }
+
+    #[cfg(fuzzing)]
+    impl<'a> arbitrary::Arbitrary<'a> for TestAccountMeta {
+        fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+            let mut source = ArbitrarySource(u);
+            TestAccountMeta::generate(&mut source)
         }
     }
 
@@ -1066,7 +1289,57 @@ pub mod arbitrary_impls {
                 .collect(),
             // Duplicates are handled separately in create_test_accounts_from_types
             TestAccountType::Duplicate(_) => vec![],
+            TestAccountType::LikeTypeSize1(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::LikeTypeSize2(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::LikeTypeSize7(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::LikeTypeSize13(sized, meta) => {
+                let data = sized.0.to_vec();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
+            TestAccountType::AlignedKnown(u64s, meta) => {
+                // Flatten Vec<u64> to bytes (little-endian)
+                let data: Vec<u8> = u64s.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let (acc, data) = create_test_account_with_meta(&meta, data);
+                vec![(acc, data, meta.rent_epoch)]
+            }
         }
+    }
+
+    /// Helper to verify account metadata matches expected values.
+    /// Returns false if any field doesn't match.
+    fn verify_account_meta(static_data: &NonDupAccountStatic, meta: &TestAccountMeta) -> bool {
+        (static_data.is_signer == 1) == meta.is_signer
+            && (static_data.is_writable == 1) == meta.is_writable
+            && (static_data.executable == 1) == meta.executable
+            && static_data.lamports == meta.lamports
+    }
+
+    /// Helper to verify account metadata and rent_epoch for NonDupAccount.
+    /// Returns false if any field doesn't match.
+    fn verify_non_dup_account_meta(acc: &NonDupAccount, meta: &TestAccountMeta) -> bool {
+        verify_account_meta(acc.static_data, meta) && *acc.rent_epoch == meta.rent_epoch
+    }
+
+    /// Helper to verify account metadata and rent_epoch for TypedNonDupAccount.
+    /// Returns false if any field doesn't match.
+    fn verify_typed_account_meta<T: Pod + Zeroable>(
+        acc: &TypedNonDupAccount<T>,
+        meta: &TestAccountMeta,
+    ) -> bool {
+        verify_account_meta(&acc.static_data, meta) && acc.rent_epoch == meta.rent_epoch
     }
 
     /// Converts a list of TestAccountType into a flat list of TestAccount,
@@ -1134,49 +1407,21 @@ pub mod arbitrary_impls {
                 TestAccountType::Aligned(al, meta) => {
                     let (acc, next) =
                         unsafe { iterator.static_slurp_typed_account::<QuickCheckAligned>() };
-                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckAligned>() as u64 {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != meta.is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != meta.is_writable {
-                        return false;
-                    }
-                    if (acc.static_data.executable == 1) != meta.executable {
-                        return false;
-                    }
-                    if acc.static_data.lamports != meta.lamports {
-                        return false;
-                    }
-                    if acc.rent_epoch != meta.rent_epoch {
-                        return false;
-                    }
-                    if acc.data != al {
+                    if acc.static_data.data_len != std::mem::size_of::<QuickCheckAligned>() as u64
+                        || !verify_typed_account_meta(acc, &meta)
+                        || acc.data != al
+                    {
                         return false;
                     }
                     iterator = next;
                 }
                 TestAccountType::Unaligned(un, meta) => {
-                    let (acc, next) =
-                        unsafe { iterator.like_type_known_next_full_account::<QuickCheckUnaligned>() };
+                    let (acc, next) = unsafe {
+                        iterator.like_type_known_next_full_account::<QuickCheckUnaligned>()
+                    };
                     if acc.static_data.data_len != std::mem::size_of::<QuickCheckUnaligned>() as u64
+                        || !verify_non_dup_account_meta(&acc, &meta)
                     {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != meta.is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != meta.is_writable {
-                        return false;
-                    }
-                    if (acc.static_data.executable == 1) != meta.executable {
-                        return false;
-                    }
-                    if acc.static_data.lamports != meta.lamports {
-                        return false;
-                    }
-                    if *acc.rent_epoch != meta.rent_epoch {
                         return false;
                     }
                     let data_as_struct =
@@ -1189,44 +1434,14 @@ pub mod arbitrary_impls {
                 TestAccountType::Empty(_, meta) => {
                     let (acc, next) =
                         unsafe { iterator.like_type_known_next_full_account::<QuickCheckEmpty>() };
-                    if acc.static_data.data_len != 0 {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != meta.is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != meta.is_writable {
-                        return false;
-                    }
-                    if (acc.static_data.executable == 1) != meta.executable {
-                        return false;
-                    }
-                    if acc.static_data.lamports != meta.lamports {
-                        return false;
-                    }
-                    if *acc.rent_epoch != meta.rent_epoch {
+                    if acc.static_data.data_len != 0 || !verify_non_dup_account_meta(&acc, &meta) {
                         return false;
                     }
                     iterator = next;
                 }
                 TestAccountType::Untyped(data, meta) => {
                     let (acc, next) = unsafe { iterator.known_next_full_account() };
-                    if acc.data() != data.as_slice() {
-                        return false;
-                    }
-                    if (acc.static_data.is_signer == 1) != meta.is_signer {
-                        return false;
-                    }
-                    if (acc.static_data.is_writable == 1) != meta.is_writable {
-                        return false;
-                    }
-                    if (acc.static_data.executable == 1) != meta.executable {
-                        return false;
-                    }
-                    if acc.static_data.lamports != meta.lamports {
-                        return false;
-                    }
-                    if *acc.rent_epoch != meta.rent_epoch {
+                    if acc.data() != data.as_slice() || !verify_non_dup_account_meta(&acc, &meta) {
                         return false;
                     }
                     iterator = next;
@@ -1237,25 +1452,9 @@ pub mod arbitrary_impls {
                     for ((given, meta), acc) in array.iter().zip(accs.iter()) {
                         if acc.static_data.data_len
                             != std::mem::size_of::<QuickCheckAligned>() as u64
+                            || !verify_typed_account_meta(acc, meta)
+                            || &acc.data != given
                         {
-                            return false;
-                        }
-                        if (acc.static_data.is_signer == 1) != meta.is_signer {
-                            return false;
-                        }
-                        if (acc.static_data.is_writable == 1) != meta.is_writable {
-                            return false;
-                        }
-                        if (acc.static_data.executable == 1) != meta.executable {
-                            return false;
-                        }
-                        if acc.static_data.lamports != meta.lamports {
-                            return false;
-                        }
-                        if acc.rent_epoch != meta.rent_epoch {
-                            return false;
-                        }
-                        if &acc.data != given {
                             return false;
                         }
                     }
@@ -1267,25 +1466,9 @@ pub mod arbitrary_impls {
                     for ((given, meta), acc) in array.iter().zip(accs.iter()) {
                         if acc.static_data.data_len
                             != std::mem::size_of::<QuickCheckAligned>() as u64
+                            || !verify_typed_account_meta(acc, meta)
+                            || &acc.data != given
                         {
-                            return false;
-                        }
-                        if (acc.static_data.is_signer == 1) != meta.is_signer {
-                            return false;
-                        }
-                        if (acc.static_data.is_writable == 1) != meta.is_writable {
-                            return false;
-                        }
-                        if (acc.static_data.executable == 1) != meta.executable {
-                            return false;
-                        }
-                        if acc.static_data.lamports != meta.lamports {
-                            return false;
-                        }
-                        if acc.rent_epoch != meta.rent_epoch {
-                            return false;
-                        }
-                        if &acc.data != given {
                             return false;
                         }
                     }
@@ -1294,6 +1477,63 @@ pub mod arbitrary_impls {
                 TestAccountType::Duplicate(_) => {
                     // Duplicates are filtered out before this loop, so this is unreachable
                     unreachable!("Duplicate variants should have been filtered out")
+                }
+                TestAccountType::LikeTypeSize1(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size1Struct>() as u64
+                        || !verify_non_dup_account_meta(&acc, &meta)
+                        || acc.data() != expected.0.as_slice()
+                    {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::LikeTypeSize2(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size2Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size2Struct>() as u64
+                        || !verify_non_dup_account_meta(&acc, &meta)
+                        || acc.data() != expected.0.as_slice()
+                    {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::LikeTypeSize7(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size7Struct>() as u64
+                        || !verify_non_dup_account_meta(&acc, &meta)
+                        || acc.data() != expected.0.as_slice()
+                    {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::LikeTypeSize13(expected, meta) => {
+                    let (acc, next) =
+                        unsafe { iterator.like_type_known_next_full_account::<Size13Struct>() };
+                    if acc.static_data.data_len != std::mem::size_of::<Size13Struct>() as u64
+                        || !verify_non_dup_account_meta(&acc, &meta)
+                        || acc.data() != expected.0.as_slice()
+                    {
+                        return false;
+                    }
+                    iterator = next;
+                }
+                TestAccountType::AlignedKnown(expected_u64s, meta) => {
+                    let (acc, next) = unsafe { iterator.aligned_known_next_full_account() };
+                    // Flatten Vec<u64> to bytes for comparison
+                    let expected_bytes: Vec<u8> =
+                        expected_u64s.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    if acc.static_data.data_len != expected_bytes.len() as u64
+                        || !verify_non_dup_account_meta(&acc, &meta)
+                        || acc.data() != expected_bytes.as_slice()
+                    {
+                        return false;
+                    }
+                    iterator = next;
                 }
             }
         }
@@ -2027,15 +2267,18 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        let (acc1, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
+        let (acc1, iterator) =
+            unsafe { iterator.like_type_known_next_full_account::<Size1Struct>() };
         assert_eq!(acc1.data().len(), 1);
         assert_eq!(acc1.data()[0], 0xAA);
 
-        let (acc7, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
+        let (acc7, iterator) =
+            unsafe { iterator.like_type_known_next_full_account::<Size7Struct>() };
         assert_eq!(acc7.data().len(), 7);
         assert_eq!(acc7.data(), &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
 
-        let (acc5, iterator) = unsafe { iterator.like_type_known_next_full_account::<Size5Struct>() };
+        let (acc5, iterator) =
+            unsafe { iterator.like_type_known_next_full_account::<Size5Struct>() };
         assert_eq!(acc5.data().len(), 5);
         assert_eq!(acc5.data(), &[0x10, 0x20, 0x30, 0x40, 0x50]);
 
