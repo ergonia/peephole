@@ -72,7 +72,7 @@
 //!
 //! - [`account_iterator`]: Core iterator and account types ([`AccountIterator`](account_iterator::AccountIterator),
 //!   [`NonDupAccount`](account_iterator::NonDupAccount), [`TypedNonDupAccount`](account_iterator::TypedNonDupAccount))
-//! - [`assume`]: `debug_assert!` that becomes `unreachable_unchecked` in release
+//! - [`assume!`]: `debug_assert!` that becomes `unreachable_unchecked` in release
 //! - [`pubkey_byte_map`]: O(1) pubkey lookup (up to 256 keys, indexed by first byte)
 
 #[cfg(any(test, feature = "std"))]
