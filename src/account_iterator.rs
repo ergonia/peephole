@@ -577,8 +577,10 @@ impl AccountIterator {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, PartialEq, Eq, Debug)]
 pub struct NonDupAccountStatic {
-    /// `0xFF` for real accounts, `0x00-0xFE` for duplicates (index of original).
-    pub is_dup: u8,
+    // `0xFF` for real accounts, `0x00-0xFE` for duplicates (index of original).
+    // We know this account is not a duplicate, so this is always 0xFF.
+    // field is present to match layout.
+    _is_dup: u8,
     /// Non-zero if this account signed the transaction.
     pub is_signer: u8,
     /// Non-zero if this account is writable.
@@ -703,7 +705,7 @@ pub mod arbitrary_impls {
             } else {
                 let data = Vec::<u8>::arbitrary(g);
                 let static_data = NonDupAccountStatic {
-                    is_dup: NON_DUP_MARKER,
+                    _is_dup: NON_DUP_MARKER,
                     is_signer: bool::arbitrary(g) as u8,
                     is_writable: bool::arbitrary(g) as u8,
                     executable: bool::arbitrary(g) as u8,
@@ -735,7 +737,7 @@ pub mod arbitrary_impls {
         data: Vec<u8>,
     ) -> (NonDupAccountStatic, Vec<u8>) {
         let account = NonDupAccountStatic {
-            is_dup: NON_DUP_MARKER,
+            _is_dup: NON_DUP_MARKER,
             is_signer: is_signer as u8,
             is_writable: is_writable as u8,
             executable: executable as u8,
@@ -1132,7 +1134,10 @@ pub mod arbitrary_impls {
                     let a = rng.gen_u16()?;
                     let b = rng.gen_u8()?;
                     let meta = TestAccountMeta::generate(rng)?;
-                    Ok(TestAccountType::Unaligned(QuickCheckUnaligned { a, b }, meta))
+                    Ok(TestAccountType::Unaligned(
+                        QuickCheckUnaligned { a, b },
+                        meta,
+                    ))
                 }
                 2 => {
                     let meta = TestAccountMeta::generate(rng)?;
