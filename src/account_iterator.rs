@@ -218,8 +218,20 @@ impl AccountIterator {
     /// and point to a properly formatted instruction buffer.
     #[inline]
     pub unsafe fn new_from_instruction(base: *mut u8) -> Self {
-        let (num_accounts, next_ptr) = unsafe { slurp::<u64>(base) };
-        Self::new_from_raw(next_ptr, *num_accounts as usize)
+        let (num_accounts, next_ptr) = Self::read_number_of_accounts(base);
+        Self::new_from_raw(next_ptr, num_accounts)
+    }
+
+    /// Reader the number of accounts from raw buffer passed to entrypoint
+    ///
+    /// # Safety
+    ///
+    /// Only call this on data from the Solana runtime. The pointer must be valid
+    /// and point to a properly formatted instruction buffer.
+    #[inline]
+    pub unsafe fn read_number_of_accounts(base: *mut u8) -> (usize, *mut u8) {
+        let (num_accounts, _next_ptr) = unsafe { slurp::<u64>(base) };
+        (*num_accounts as usize, _next_ptr)
     }
 
     /// Creates an iterator from a raw pointer and count. Useful for resuming iteration
