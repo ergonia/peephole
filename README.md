@@ -21,23 +21,27 @@ Feature flags: `solana-sdk` or `pinocchio-sdk` (exactly one required).
 ## Basic Iteration
 
 ```rust
-use peephole::account_iterator::{AccountIterator, NextAccount, AccountInInstruction};
+use peephole::account_iterator::{AccountIterator, NextHeader};
 
 let mut iter = unsafe { AccountIterator::new_from_instruction(input) };
 
 loop {
-    match iter.next() {
-        NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
-            let key = &acc.static_data.key;
+    match iter.next_header() {
+        NextHeader::Header(cursor) => {
+            // Inspect header before parsing data
+            let key = &cursor.static_data.key;
+            let data_len = cursor.data_len();
+            // Parse the full account when ready
+            let (acc, next) = unsafe { cursor.parse_data() };
             let lamports = acc.static_data.lamports;
             let data: &[u8] = acc.data();
             iter = next;
         }
-        NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+        NextHeader::Dup(idx, next) => {
             // Duplicate of account `idx`—runtime only serializes full data once
             iter = next;
         }
-        NextAccount::Data(instruction_data, program_id) => {
+        NextHeader::Data(instruction_data, program_id) => {
             // instruction_data: &mut [u8], program_id: &Pubkey
             break;
         }
@@ -155,14 +159,15 @@ Real account layout:
 ## Types
 
 ```rust
-pub enum NextAccount {
-    Account(AccountInInstruction, AccountIterator),
+pub enum NextHeader {
+    Header(AccountHeaderCursor<'static>),      // Real account header
+    Dup(usize, AccountIterator),               // Duplicate marker + next iterator
     Data(&'static mut [u8], &'static Pubkey),  // (instruction_data, program_id)
 }
 
-pub enum AccountInInstruction {
-    RealAccount(NonDupAccount<'static>),
-    Dup(usize),
+pub struct AccountHeaderCursor<'a> {
+    pub static_data: &'a NonDupAccountStatic,
+    // ... remaining_accounts_after (internal)
 }
 
 pub struct NonDupAccount<'a> {

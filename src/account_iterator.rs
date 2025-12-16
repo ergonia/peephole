@@ -110,22 +110,6 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{assume, bytes::slurp};
 
-/// An account in the instruction buffer: either a real account or a duplicate marker.
-pub enum AccountInInstruction {
-    /// Full account with metadata and data.
-    RealAccount(NonDupAccount<'static>),
-    /// Duplicate—the `usize` is the index of the original account.
-    Dup(usize),
-}
-
-/// Result of `AccountIterator::next()`.
-pub enum NextAccount {
-    /// All accounts consumed. Contains (instruction_data, program_id).
-    Data(&'static mut [u8], &'static Pubkey),
-    /// An account and the iterator positioned after it.
-    Account(AccountInInstruction, AccountIterator),
-}
-
 /// Result of `AccountIterator::next_header()`.
 pub enum NextHeader {
     /// All accounts consumed. Contains (instruction_data, program_id).
@@ -143,8 +127,9 @@ pub enum NextHeader {
 /// - Peek at data before committing to parse
 /// - Validate size before costly typed parsing
 ///
-/// The cursor holds a reference to the 128-byte header and a pointer to the
-/// data region. Data slice creation is deferred until you call a parse method.
+/// The cursor holds a reference to the 128-byte header. The data pointer is
+/// computed from the header location (data always directly follows header).
+/// Data slice creation is deferred until you call a parse method.
 ///
 /// # Lifetime Safety
 ///
@@ -154,8 +139,6 @@ pub enum NextHeader {
 pub struct AccountHeaderCursor<'a> {
     /// The 128-byte header with key, owner, lamports, etc.
     pub static_data: &'a NonDupAccountStatic,
-    /// Pointer to account data (deferred slice creation).
-    data_ptr: *mut u8,
     /// Accounts remaining after this one.
     remaining_accounts_after: usize,
 }
@@ -297,27 +280,6 @@ impl AccountIterator {
         }
     }
 
-    /// Advances to the next account, or returns instruction data and program ID if done.
-    #[inline(always)]
-    pub fn next(self) -> NextAccount {
-        if self.remaining_accounts == 0 {
-            let (slice, program_id) = self.slurp_instruction_data();
-            NextAccount::Data(slice, program_id)
-        } else {
-            let is_dup = unsafe { *self.base_ptr };
-            let (acc, next) = if is_dup == NON_DUP_MARKER {
-                let (non_dup, next) = unsafe { self.slurp_real_account::<Dynamic>() };
-                (AccountInInstruction::RealAccount(non_dup), next)
-            } else {
-                let next = unsafe { self.base_ptr.add(8) };
-                (AccountInInstruction::Dup(is_dup as usize), next)
-            };
-            NextAccount::Account(acc, unsafe {
-                AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
-            })
-        }
-    }
-
     /// Gets the next account, assuming it's a real account (not a duplicate marker).
     ///
     /// # Safety
@@ -325,15 +287,7 @@ impl AccountIterator {
     /// The next account must be real (marker byte `0xFF`). Panics in debug if it's a dup.
     #[inline]
     pub unsafe fn known_next_full_account(self) -> (NonDupAccount<'static>, AccountIterator) {
-        debug_assert!(self.remaining_accounts > 0);
-
-        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
-
-        let (account, next) = self.slurp_real_account::<Dynamic>();
-
-        (account, unsafe {
-            AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
-        })
+        self.known_next_header().parse_data()
     }
 
     /// Parses only the account header, returning a cursor for data operations.
@@ -351,11 +305,10 @@ impl AccountIterator {
         debug_assert!(self.remaining_accounts > 0);
         debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
 
-        let (static_data, data_ptr) = slurp::<NonDupAccountStatic>(self.base_ptr);
+        let (static_data, _) = slurp::<NonDupAccountStatic>(self.base_ptr);
 
         AccountHeaderCursor {
             static_data,
-            data_ptr,
             remaining_accounts_after: self.remaining_accounts - 1,
         }
     }
@@ -393,21 +346,7 @@ impl AccountIterator {
     pub unsafe fn aligned_known_next_full_account(
         self,
     ) -> (NonDupAccount<'static>, AccountIterator) {
-        debug_assert!(self.remaining_accounts > 0);
-
-        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
-
-        let (account, next) = self.slurp_real_account::<Aligned>();
-
-        // Verify alignment assumption - compiler can use this hint to eliminate alignment code
-        assume!(
-            (next as usize) % BPF_ALIGN_OF_U128 == 0,
-            "aligned_known_next_full_account: next pointer not 8-byte aligned"
-        );
-
-        (account, unsafe {
-            AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
-        })
+        self.known_next_header().parse_data_aligned()
     }
 
     /// Gets the next account, assuming it's real and its data matches type `T`'s
@@ -420,16 +359,7 @@ impl AccountIterator {
     pub unsafe fn like_type_known_next_full_account<T>(
         self,
     ) -> (NonDupAccount<'static>, AccountIterator) {
-        debug_assert!(self.remaining_accounts > 0);
-
-        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
-
-        let (account, next) = self.slurp_real_account::<TypedSlurper<T>>();
-
-        (
-            account,
-            AccountIterator::new_from_raw(next, self.remaining_accounts - 1),
-        )
+        self.known_next_header().parse_data_like_type::<T>()
     }
 
     /// Slurp one typed account. Returns a `TypedNonDupAccount<T>` pointing directly into
@@ -544,37 +474,6 @@ impl AccountIterator {
     }
 
     #[inline]
-    unsafe fn slurp_real_account<S: Slurper>(&self) -> (NonDupAccount<'static>, *mut u8) {
-        let (account_static, next) = unsafe { slurp::<NonDupAccountStatic>(self.base_ptr) };
-        let data_len = S::get_account_size(&account_static.data_len);
-
-        debug_assert_eq!(
-            data_len as usize, account_static.data_len as usize,
-            "Account data length does not match expected size"
-        );
-
-        let data = core::slice::from_raw_parts_mut(next, data_len as usize);
-
-        let next = next.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
-
-        let next = S::get_next_pointer(next);
-        assume!(
-            next.align_offset(BPF_ALIGN_OF_U128) == 0,
-            "Next account pointer not 8-byte aligned"
-        );
-
-        let (rent_epoch, next) = slurp::<u64>(next);
-
-        let account = NonDupAccount {
-            static_data: account_static,
-            all_data: data,
-            rent_epoch,
-        };
-
-        (account, next)
-    }
-
-    #[inline]
     unsafe fn slurp_typed_account<T: Pod + Zeroable, const N: usize>(
         &self,
     ) -> (&'static mut [TypedNonDupAccount<T>; N], *mut u8)
@@ -611,31 +510,27 @@ impl AccountIterator {
             let mut copy_of_self = self.unsafe_clone();
 
             for _ in 0..N {
-                match copy_of_self.next() {
-                    NextAccount::Account(acc, next_iter) => {
-                        copy_of_self = next_iter;
-                        match acc {
-                            AccountInInstruction::RealAccount(acc) => {
-                                if acc.static_data.data_len != core::mem::size_of::<T>() as u64 {
-                                    panic!(
-                                        "Expected account size of {} but got {}",
-                                        core::mem::size_of::<T>() as u64,
-                                        acc.static_data.data_len
-                                    );
-                                }
-                            }
-                            AccountInInstruction::Dup(_) => {
-                                panic!("Expected a real account, found a duplicate")
-                            }
+                match copy_of_self.next_header() {
+                    NextHeader::Header(cursor) => {
+                        if cursor.static_data.data_len != core::mem::size_of::<T>() as u64 {
+                            panic!(
+                                "Expected account size of {} but got {}",
+                                core::mem::size_of::<T>() as u64,
+                                cursor.static_data.data_len
+                            );
                         }
+                        copy_of_self = cursor.skip();
                     }
-                    NextAccount::Data(_, _) => {
+                    NextHeader::Dup(_, _) => {
+                        panic!("Expected a real account, found a duplicate")
+                    }
+                    NextHeader::Data(_, _) => {
                         panic!("Expected an account, found instruction data")
                     }
                 }
             }
 
-            assert_eq!(next_bytes, copy_of_self.base_ptr);
+            assert_eq!(next_bytes, copy_of_self.base_ptr());
         }
 
         (data, next_bytes)
@@ -670,6 +565,19 @@ impl AccountIterator {
 // ============================================================================
 
 impl<'a> AccountHeaderCursor<'a> {
+    // ------------------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------------------
+
+    /// Returns pointer to account data (immediately after header).
+    #[inline]
+    fn data_ptr(&self) -> *mut u8 {
+        // SAFETY: static_data was created from a valid account buffer, and data
+        // always directly follows the header in Solana's buffer layout.
+        // .add(1) advances by size_of::<NonDupAccountStatic>() bytes
+        unsafe { (self.static_data as *const NonDupAccountStatic).add(1) as *mut u8 }
+    }
+
     // ------------------------------------------------------------------------
     // Size inspection (safe, no pointer arithmetic)
     // ------------------------------------------------------------------------
@@ -710,7 +618,7 @@ impl<'a> AccountHeaderCursor<'a> {
     /// consuming methods (`parse_data`, `skip`).
     #[inline]
     pub unsafe fn peek_data_ptr(&self) -> *const u8 {
-        self.data_ptr
+        self.data_ptr()
     }
 
     /// Mutable raw pointer to account data start.
@@ -721,7 +629,7 @@ impl<'a> AccountHeaderCursor<'a> {
     /// consuming methods (`parse_data`, `skip`).
     #[inline]
     pub unsafe fn peek_data_ptr_mut(&self) -> *mut u8 {
-        self.data_ptr
+        self.data_ptr()
     }
 
     /// Peek at first `len` bytes of account data.
@@ -736,7 +644,7 @@ impl<'a> AccountHeaderCursor<'a> {
             return None;
         }
         // SAFETY: data_ptr valid by construction, bounds checked above
-        Some(unsafe { core::slice::from_raw_parts(self.data_ptr, len) })
+        Some(unsafe { core::slice::from_raw_parts(self.data_ptr(), len) })
     }
 
     /// Peek at first `len` bytes of account data, mutable.
@@ -751,7 +659,7 @@ impl<'a> AccountHeaderCursor<'a> {
             return None;
         }
         // SAFETY: data_ptr valid by construction, bounds checked above
-        Some(unsafe { core::slice::from_raw_parts_mut(self.data_ptr, len) })
+        Some(unsafe { core::slice::from_raw_parts_mut(self.data_ptr(), len) })
     }
 
     /// Peek at account data as type `T`.
@@ -766,7 +674,7 @@ impl<'a> AccountHeaderCursor<'a> {
             return None;
         }
         // SAFETY: data_ptr valid by construction, size checked above
-        Some(unsafe { &*(self.data_ptr as *const T) })
+        Some(unsafe { &*(self.data_ptr() as *const T) })
     }
 
     /// Peek at account data as type `T`, mutable.
@@ -781,18 +689,14 @@ impl<'a> AccountHeaderCursor<'a> {
             return None;
         }
         // SAFETY: data_ptr valid by construction, size checked above
-        Some(unsafe { &mut *(self.data_ptr as *mut T) })
+        Some(unsafe { &mut *(self.data_ptr() as *mut T) })
     }
-
-    // ------------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------------
 
     /// Compute the pointer to the next account without creating a data slice.
     #[inline]
     unsafe fn compute_next_ptr<S: Slurper>(&self) -> *mut u8 {
         let data_len = S::get_account_size(&self.static_data.data_len);
-        let next = self.data_ptr.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = self.data_ptr().add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
         let next = S::get_next_pointer(next);
         // Skip rent_epoch (8 bytes)
         next.add(8)
@@ -848,9 +752,10 @@ impl<'a> AccountHeaderCursor<'a> {
     #[inline]
     unsafe fn parse_data_impl<S: Slurper>(self) -> (NonDupAccount<'a>, AccountIterator) {
         let data_len = S::get_account_size(&self.static_data.data_len);
-        let data = core::slice::from_raw_parts_mut(self.data_ptr, data_len as usize);
+        let data_ptr = self.data_ptr();
+        let data = core::slice::from_raw_parts_mut(data_ptr, data_len as usize);
 
-        let next = self.data_ptr.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = data_ptr.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
         let next = S::get_next_pointer(next);
         let (rent_epoch, next) = slurp::<u64>(next);
 
@@ -1889,10 +1794,16 @@ pub mod arbitrary_impls {
         }
 
         // Verify we've reached the instruction data
-        let NextAccount::Data(check, _program_iter) = iterator.next() else {
+        let NextHeader::Data(check, _program_iter) = iterator.next_header() else {
             return false;
         };
         check == instruction_data_gen.as_slice()
+    }
+
+    /// Parsed account for comparison in tests.
+    enum ParsedAccountForTest<'a> {
+        Real(NonDupAccount<'a>),
+        Dup(usize),
     }
 
     pub fn do_quickcheck_compare_with_solana_deserialize(
@@ -1911,16 +1822,21 @@ pub mod arbitrary_impls {
             create_test_instruction(test_accounts.clone(), instruction_data_gen.clone());
 
         // 3. Parse with AccountIterator
-        let mut fast_results = Vec::new();
+        let mut fast_results: Vec<ParsedAccountForTest> = Vec::new();
         let mut fast_iter =
             unsafe { AccountIterator::new_from_instruction(instruction_buffer.as_mut_ptr()) };
         let (final_fast_data, fast_program_id) = loop {
-            match fast_iter.next() {
-                NextAccount::Account(acc, next_iter) => {
-                    fast_results.push(acc);
+            match fast_iter.next_header() {
+                NextHeader::Header(cursor) => {
+                    let (acc, next_iter) = unsafe { cursor.parse_data() };
+                    fast_results.push(ParsedAccountForTest::Real(acc));
                     fast_iter = next_iter;
                 }
-                NextAccount::Data(data, program_iter) => {
+                NextHeader::Dup(idx, next_iter) => {
+                    fast_results.push(ParsedAccountForTest::Dup(idx));
+                    fast_iter = next_iter;
+                }
+                NextHeader::Data(data, program_iter) => {
                     break (data.to_vec(), *program_iter); // Clone data for comparison
                 }
             }
@@ -1956,7 +1872,7 @@ pub mod arbitrary_impls {
             fast_results.iter().zip(accounts_solana.iter()).enumerate()
         {
             match fast_acc {
-                AccountInInstruction::RealAccount(fast_real) => {
+                ParsedAccountForTest::Real(fast_real) => {
                     // Compare fields for real accounts
                     if fast_real.static_data.key != *solana_acc.get_key() {
                         eprintln!("Key mismatch at index {}", i);
@@ -1991,7 +1907,7 @@ pub mod arbitrary_impls {
                         return false;
                     }
                 }
-                AccountInInstruction::Dup(dup_index) => {
+                ParsedAccountForTest::Dup(dup_index) => {
                     // For duplicates, Solana gives us a full AccountInfo that should
                     // have the same key as the original account at dup_index.
                     // The data also points to the same underlying buffer.
@@ -2066,13 +1982,11 @@ mod tests {
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         for expected_account in accounts {
-            match iterator.next() {
-                NextAccount::Account(parsed_account, next_iter) => {
-                    match (expected_account, parsed_account) {
-                        (
-                            TestAccount::Real(expected, expected_data, expected_rent_epoch),
-                            AccountInInstruction::RealAccount(parsed),
-                        ) => {
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => {
+                    let (parsed, next_iter) = unsafe { cursor.parse_data() };
+                    match expected_account {
+                        TestAccount::Real(expected, expected_data, expected_rent_epoch) => {
                             assert_eq!(parsed.static_data.is_signer, expected.is_signer);
                             assert_eq!(parsed.static_data.is_writable, expected.is_writable);
                             assert_eq!(parsed.static_data.executable, expected.executable);
@@ -2083,23 +1997,26 @@ mod tests {
                             assert_eq!(parsed.data(), expected_data);
                             assert_eq!(*parsed.rent_epoch, expected_rent_epoch);
                         }
-                        (
-                            TestAccount::Duplicate(expected_index),
-                            AccountInInstruction::Dup(parsed_index),
-                        ) => {
-                            assert_eq!(parsed_index, expected_index as usize);
-                        }
-                        _ => panic!("Mismatched account types"),
+                        TestAccount::Duplicate(_) => panic!("Expected real account, got dup marker"),
                     }
                     iterator = next_iter;
                 }
-                NextAccount::Data(_, _) => panic!("Expected an account, found instruction data"),
+                NextHeader::Dup(parsed_index, next_iter) => {
+                    match expected_account {
+                        TestAccount::Duplicate(expected_index) => {
+                            assert_eq!(parsed_index, expected_index as usize);
+                        }
+                        TestAccount::Real(_, _, _) => panic!("Expected dup, got real account"),
+                    }
+                    iterator = next_iter;
+                }
+                NextHeader::Data(_, _) => panic!("Expected an account, found instruction data"),
             }
         }
 
         // Check instruction data
-        match iterator.next() {
-            NextAccount::Data(parsed_data, _) => {
+        match iterator.next_header() {
+            NextHeader::Data(parsed_data, _) => {
                 assert_eq!(parsed_data, instruction_data.as_slice())
             }
             _ => panic!("Expected instruction data"),
@@ -2162,8 +2079,8 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
+        match iterator.next_header() {
+            NextHeader::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -2179,14 +2096,15 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Account(AccountInInstruction::RealAccount(acc), next_iter) => {
+        match iterator.next_header() {
+            NextHeader::Header(cursor) => {
+                let (acc, next_iter) = unsafe { cursor.parse_data() };
                 assert_eq!(acc.static_data.is_signer, 1);
                 assert_eq!(acc.static_data.is_writable, 1);
                 assert_eq!(acc.static_data.data_len, 4);
 
-                match next_iter.next() {
-                    NextAccount::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
+                match next_iter.next_header() {
+                    NextHeader::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
                     _ => panic!("Expected instruction data"),
                 }
             }
@@ -2211,16 +2129,17 @@ mod tests {
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         for _ in 0..2 {
-            match iterator.next() {
-                NextAccount::Account(AccountInInstruction::RealAccount(_), next_iter) => {
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => {
+                    let (_, next_iter) = unsafe { cursor.parse_data() };
                     iterator = next_iter;
                 }
                 _ => panic!("Expected a real account"),
             }
         }
 
-        match iterator.next() {
-            NextAccount::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
+        match iterator.next_header() {
+            NextHeader::Data(data, _) => assert_eq!(data, instruction_data.as_slice()),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -2239,16 +2158,18 @@ mod tests {
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Account(AccountInInstruction::Dup(index), next_iter) => {
+        match iterator.next_header() {
+            NextHeader::Dup(index, next_iter) => {
                 assert_eq!(index, 0);
                 iterator = next_iter;
             }
             _ => panic!("Expected a dup account"),
         }
 
-        match iterator.next() {
-            NextAccount::Account(AccountInInstruction::RealAccount(_), _) => {}
+        match iterator.next_header() {
+            NextHeader::Header(cursor) => {
+                let _ = unsafe { cursor.parse_data() };
+            }
             _ => panic!("Expected a real account"),
         }
     }
@@ -2271,9 +2192,18 @@ mod tests {
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
         let mut count = 0;
 
-        while let NextAccount::Account(_, next_iter) = iterator.next() {
-            count += 1;
-            iterator = next_iter;
+        loop {
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => {
+                    count += 1;
+                    iterator = unsafe { cursor.skip() };
+                }
+                NextHeader::Dup(_, next_iter) => {
+                    count += 1;
+                    iterator = next_iter;
+                }
+                NextHeader::Data(_, _) => break,
+            }
         }
 
         assert_eq!(count, num_accounts);
@@ -2287,8 +2217,8 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Data(data, _) => assert_eq!(data.len(), instruction_data.len()),
+        match iterator.next_header() {
+            NextHeader::Data(data, _) => assert_eq!(data.len(), instruction_data.len()),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -2308,15 +2238,13 @@ mod tests {
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        if let NextAccount::Account(AccountInInstruction::RealAccount(acc1), next_iter) =
-            iterator.next()
-        {
+        if let NextHeader::Header(cursor) = iterator.next_header() {
+            let (acc1, next_iter) = unsafe { cursor.parse_data() };
             assert_eq!(acc1.static_data.data_len, 4);
             iterator = next_iter;
 
-            if let NextAccount::Account(AccountInInstruction::RealAccount(acc2), _) =
-                iterator.next()
-            {
+            if let NextHeader::Header(cursor) = iterator.next_header() {
+                let (acc2, _) = unsafe { cursor.parse_data() };
                 assert_eq!(acc2.static_data.data_len, 6);
             } else {
                 panic!("Expected second account");
@@ -2341,15 +2269,13 @@ mod tests {
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        if let NextAccount::Account(AccountInInstruction::RealAccount(acc1), next_iter) =
-            iterator.next()
-        {
+        if let NextHeader::Header(cursor) = iterator.next_header() {
+            let (acc1, next_iter) = unsafe { cursor.parse_data() };
             assert_eq!(acc1.data(), data1);
             iterator = next_iter;
 
-            if let NextAccount::Account(AccountInInstruction::RealAccount(acc2), _) =
-                iterator.next()
-            {
+            if let NextHeader::Header(cursor) = iterator.next_header() {
+                let (acc2, _) = unsafe { cursor.parse_data() };
                 assert_eq!(acc2.data(), data2);
             } else {
                 panic!("Expected second account");
@@ -2701,8 +2627,8 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Data(data, program_id) => {
+        match iterator.next_header() {
+            NextHeader::Data(data, program_id) => {
                 assert_eq!(data, instruction_data.as_slice());
                 assert_eq!(*program_id, expected_program_id);
             }
@@ -2731,8 +2657,8 @@ mod tests {
         assert_eq!(acc.static_data.data_len, 8);
 
         // Verify we can continue to instruction data
-        match next_iter.next() {
-            NextAccount::Data(instr_data, _) => assert_eq!(instr_data, &[9, 10]),
+        match next_iter.next_header() {
+            NextHeader::Data(instr_data, _) => assert_eq!(instr_data, &[9, 10]),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -2759,8 +2685,8 @@ mod tests {
         let (acc2, next_iter) = unsafe { next_iter.aligned_known_next_full_account() };
         assert_eq!(acc2.data(), data2.as_slice());
 
-        match next_iter.next() {
-            NextAccount::Data(instr_data, _) => assert_eq!(instr_data, &[]),
+        match next_iter.next_header() {
+            NextHeader::Data(instr_data, _) => assert_eq!(instr_data, &[]),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -2930,8 +2856,9 @@ mod tests {
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
         // First should be real
-        match iterator.next() {
-            NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
+        match iterator.next_header() {
+            NextHeader::Header(cursor) => {
+                let (acc, next) = unsafe { cursor.parse_data() };
                 assert_eq!(acc.data(), &[1, 2, 3, 4]);
                 iterator = next;
             }
@@ -2940,8 +2867,8 @@ mod tests {
 
         // Next three should be dups pointing to index 0
         for _ in 0..3 {
-            match iterator.next() {
-                NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+            match iterator.next_header() {
+                NextHeader::Dup(idx, next) => {
                     assert_eq!(idx, 0);
                     iterator = next;
                 }
@@ -2950,8 +2877,8 @@ mod tests {
         }
 
         // Finally instruction data
-        match iterator.next() {
-            NextAccount::Data(instr_data, _) => assert_eq!(instr_data, &[99]),
+        match iterator.next_header() {
+            NextHeader::Data(instr_data, _) => assert_eq!(instr_data, &[99]),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -2967,10 +2894,11 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Account(AccountInInstruction::RealAccount(_), next_iter) => {
-                match next_iter.next() {
-                    NextAccount::Data(data, program_id) => {
+        match iterator.next_header() {
+            NextHeader::Header(cursor) => {
+                let (_, next_iter) = unsafe { cursor.parse_data() };
+                match next_iter.next_header() {
+                    NextHeader::Data(data, program_id) => {
                         assert_eq!(data, instruction_data.as_slice());
                         assert_eq!(*program_id, expected_program_id);
                     }
@@ -3030,8 +2958,8 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Data(data, program_id) => {
+        match iterator.next_header() {
+            NextHeader::Data(data, program_id) => {
                 assert!(data.is_empty());
                 assert_eq!(*program_id, expected_program_id);
             }
@@ -3063,8 +2991,9 @@ mod tests {
 
         // Skip past 3 real accounts
         for expected_data in [10u8, 20u8, 30u8] {
-            match iterator.next() {
-                NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => {
+                    let (acc, next) = unsafe { cursor.parse_data() };
                     assert_eq!(acc.data(), &[expected_data]);
                     iterator = next;
                 }
@@ -3074,8 +3003,8 @@ mod tests {
 
         // Verify dup indices
         for expected_idx in [2usize, 0usize, 1usize] {
-            match iterator.next() {
-                NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+            match iterator.next_header() {
+                NextHeader::Dup(idx, next) => {
                     assert_eq!(idx, expected_idx);
                     iterator = next;
                 }
@@ -3128,8 +3057,8 @@ mod tests {
 
         let iterator = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        match iterator.next() {
-            NextAccount::Data(data, program_id) => {
+        match iterator.next_header() {
+            NextHeader::Data(data, program_id) => {
                 assert_eq!(data.len(), 1024);
                 assert_eq!(data, large_data.as_slice());
                 assert_eq!(*program_id, expected_program_id);
@@ -3172,8 +3101,8 @@ mod tests {
             let iterator =
                 unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-            match iterator.next() {
-                NextAccount::Data(data, program_id) => {
+            match iterator.next_header() {
+                NextHeader::Data(data, program_id) => {
                     assert_eq!(data.len(), len);
                     assert_eq!(
                         *program_id, expected_program_id,
@@ -3434,17 +3363,17 @@ mod tests {
 
         // Skip past the 255 real accounts
         for _ in 0..255 {
-            match iterator.next() {
-                NextAccount::Account(AccountInInstruction::RealAccount(_), next) => {
-                    iterator = next;
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => {
+                    iterator = unsafe { cursor.skip() };
                 }
                 _ => panic!("Expected real account"),
             }
         }
 
         // The 256th account should be a dup with index 254
-        match iterator.next() {
-            NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+        match iterator.next_header() {
+            NextHeader::Dup(idx, next) => {
                 assert_eq!(idx, 254);
                 iterator = next;
             }
@@ -3452,8 +3381,8 @@ mod tests {
         }
 
         // Verify instruction data
-        match iterator.next() {
-            NextAccount::Data(data, _) => assert_eq!(data, &[0xAB]),
+        match iterator.next_header() {
+            NextHeader::Data(data, _) => assert_eq!(data, &[0xAB]),
             _ => panic!("Expected instruction data"),
         }
     }
@@ -3482,14 +3411,14 @@ mod tests {
 
         // Skip all 4 accounts
         for _ in 0..4 {
-            match iterator.next() {
-                NextAccount::Account(_, next) => iterator = next,
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => iterator = unsafe { cursor.skip() },
                 _ => panic!("Expected an account"),
             }
         }
 
-        match iterator.next() {
-            NextAccount::Data(data, program_id) => {
+        match iterator.next_header() {
+            NextHeader::Data(data, program_id) => {
                 assert_eq!(data, instruction_data.as_slice());
                 assert_eq!(*program_id, expected_program_id);
             }
@@ -3562,23 +3491,27 @@ mod tests {
         let mut iterator =
             unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        // Skip all 3 accounts (1 real + 2 dups)
-        for i in 0..3 {
-            match iterator.next() {
-                NextAccount::Account(acc, next) => {
-                    if i == 0 {
-                        assert!(matches!(acc, AccountInInstruction::RealAccount(_)));
-                    } else {
-                        assert!(matches!(acc, AccountInInstruction::Dup(0)));
-                    }
+        // First account is real
+        match iterator.next_header() {
+            NextHeader::Header(cursor) => {
+                iterator = unsafe { cursor.skip() };
+            }
+            _ => panic!("Expected real account at index 0"),
+        }
+
+        // Next two are dups
+        for i in 1..3 {
+            match iterator.next_header() {
+                NextHeader::Dup(idx, next) => {
+                    assert_eq!(idx, 0);
                     iterator = next;
                 }
-                _ => panic!("Expected an account at index {}", i),
+                _ => panic!("Expected dup account at index {}", i),
             }
         }
 
-        match iterator.next() {
-            NextAccount::Data(data, program_id) => {
+        match iterator.next_header() {
+            NextHeader::Data(data, program_id) => {
                 assert_eq!(data, instruction_data.as_slice());
                 assert_eq!(*program_id, expected_program_id);
             }
@@ -3640,9 +3573,10 @@ mod tests {
 
         // Iterate through all accounts
         loop {
-            match iterator.next() {
-                NextAccount::Account(_, next) => iterator = next,
-                NextAccount::Data(data, program_id) => {
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => iterator = unsafe { cursor.skip() },
+                NextHeader::Dup(_, next) => iterator = next,
+                NextHeader::Data(data, program_id) => {
                     // Verify instruction data
                     if data != instruction_data_gen.as_slice() {
                         return false;
@@ -3662,64 +3596,59 @@ mod tests {
     // ============================================================================
 
     #[quickcheck_macros::quickcheck]
-    fn quickcheck_next_header_matches_next(
+    fn quickcheck_next_header_parses_correctly(
         account_types: Vec<TestAccountType>,
         instruction_data_gen: Vec<u8>,
     ) -> bool {
-        // Property: next_header() should produce equivalent results to next()
+        // Property: next_header() should correctly parse all accounts and reach instruction data
         let test_accounts = create_test_accounts_from_types(&account_types);
         if test_accounts.is_empty() {
             return true; // Skip empty case
         }
 
-        let (mut instruction, _) =
+        let expected_account_count = test_accounts.len();
+        let (mut instruction, expected_program_id) =
             create_test_instruction(test_accounts, instruction_data_gen.clone());
 
-        let iter1 = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
-        // Clone the iterator to iterate the same buffer two ways
-        let iter2 = unsafe { iter1.unsafe_clone() };
+        let mut iterator =
+            unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
 
-        let mut iter1 = iter1;
-        let mut iter2 = iter2;
+        let mut account_count = 0;
 
         loop {
-            match (iter1.next(), iter2.next_header()) {
-                (NextAccount::Data(data1, pid1), NextHeader::Data(data2, pid2)) => {
-                    return data1 == data2 && pid1 == pid2;
+            match iterator.next_header() {
+                NextHeader::Header(cursor) => {
+                    // Verify cursor has valid data length
+                    if cursor.data_len() > 10 * 1024 * 1024 {
+                        return false; // Unreasonably large
+                    }
+                    let (_, next) = unsafe { cursor.parse_data() };
+                    iterator = next;
+                    account_count += 1;
                 }
-                (
-                    NextAccount::Account(AccountInInstruction::Dup(idx1), next1),
-                    NextHeader::Dup(idx2, next2),
-                ) => {
-                    if idx1 != idx2 {
+                NextHeader::Dup(idx, next) => {
+                    // Dup index should be less than current account count
+                    if idx >= account_count {
                         return false;
                     }
-                    iter1 = next1;
-                    iter2 = next2;
+                    iterator = next;
+                    account_count += 1;
                 }
-                (
-                    NextAccount::Account(AccountInInstruction::RealAccount(acc1), next1),
-                    NextHeader::Header(cursor),
-                ) => {
-                    // Verify header matches (same underlying buffer, so pointers should match)
-                    if acc1.static_data.key != cursor.static_data.key {
+                NextHeader::Data(data, program_id) => {
+                    // Verify we parsed the expected number of accounts
+                    if account_count != expected_account_count {
                         return false;
                     }
-                    if acc1.static_data.is_signer != cursor.static_data.is_signer {
+                    // Verify instruction data matches
+                    if data != instruction_data_gen.as_slice() {
                         return false;
                     }
-                    if acc1.static_data.data_len != cursor.data_len() {
+                    // Verify program id matches
+                    if *program_id != expected_program_id {
                         return false;
                     }
-
-                    // Skip data comparison since we're iterating same buffer with aliased refs
-                    // Just verify the cursor can parse and advance correctly
-                    let (_acc2, next2) = unsafe { cursor.parse_data() };
-
-                    iter1 = next1;
-                    iter2 = next2;
+                    return true;
                 }
-                _ => return false, // Mismatched variants
             }
         }
     }
