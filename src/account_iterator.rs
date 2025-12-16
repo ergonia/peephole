@@ -632,6 +632,28 @@ impl<'a> AccountHeaderCursor<'a> {
         self.data_ptr()
     }
 
+    /// Peek at all account data bytes.
+    ///
+    /// The returned slice borrows the cursor, preventing concurrent calls to
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub fn peek(&self) -> &[u8] {
+        // SAFETY: data_ptr valid by construction, data_len from trusted header
+        unsafe { core::slice::from_raw_parts(self.data_ptr(), self.static_data.data_len as usize) }
+    }
+
+    /// Peek at all account data bytes, mutable.
+    ///
+    /// The returned slice borrows the cursor, preventing concurrent calls to
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub fn peek_mut(&mut self) -> &mut [u8] {
+        // SAFETY: data_ptr valid by construction, data_len from trusted header
+        unsafe {
+            core::slice::from_raw_parts_mut(self.data_ptr(), self.static_data.data_len as usize)
+        }
+    }
+
     /// Peek at first `len` bytes of account data.
     ///
     /// Returns `None` if `data_len < len`.
@@ -3698,6 +3720,65 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_peek() {
+        let (account, data) = create_test_account(true, true, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let cursor = unsafe { iter.known_next_header() };
+
+        // peek returns all data
+        let peeked = cursor.peek();
+        assert_eq!(peeked, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // Can still parse after peeking
+        let (acc, _) = unsafe { cursor.parse_data() };
+        assert_eq!(acc.data(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn test_cursor_peek_mut() {
+        let (account, data) = create_test_account(true, true, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let mut cursor = unsafe { iter.known_next_header() };
+
+        // Mutate through peek_mut
+        let peeked = cursor.peek_mut();
+        peeked[0] = 0xFF;
+        peeked[3] = 0x00;
+
+        // Changes persist
+        let (acc, _) = unsafe { cursor.parse_data() };
+        assert_eq!(acc.data(), &[0xFF, 0xBB, 0xCC, 0x00]);
+    }
+
+    #[test]
+    fn test_cursor_peek_bytes_mut() {
+        let (account, data) = create_test_account(true, true, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let mut cursor = unsafe { iter.known_next_header() };
+
+        // Mutate first 2 bytes
+        let peeked = cursor.peek_bytes_mut(2).unwrap();
+        peeked[0] = 0x11;
+        peeked[1] = 0x22;
+
+        // Beyond bounds returns None
+        assert!(cursor.peek_bytes_mut(5).is_none());
+
+        // Changes persist
+        let (acc, _) = unsafe { cursor.parse_data() };
+        assert_eq!(acc.data(), &[0x11, 0x22, 0xCC, 0xDD]);
+    }
+
+    #[test]
     fn test_cursor_peek_as() {
         let data_bytes: Vec<u8> = 0x12345678u64.to_le_bytes().to_vec();
         let (account, data) = create_test_account(true, true, data_bytes);
@@ -3714,6 +3795,29 @@ mod tests {
         // peek_as with wrong size returns None
         let wrong: Option<&u32> = cursor.peek_as();
         assert!(wrong.is_none());
+    }
+
+    #[test]
+    fn test_cursor_peek_as_mut() {
+        let data_bytes: Vec<u8> = 0x12345678u64.to_le_bytes().to_vec();
+        let (account, data) = create_test_account(true, true, data_bytes);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let mut cursor = unsafe { iter.known_next_header() };
+
+        // Mutate through peek_as_mut
+        let peeked: &mut u64 = cursor.peek_as_mut().unwrap();
+        *peeked = 0xDEADBEEF;
+
+        // Wrong size returns None
+        let wrong: Option<&mut u32> = cursor.peek_as_mut();
+        assert!(wrong.is_none());
+
+        // Changes persist
+        let (acc, _) = unsafe { cursor.parse_data() };
+        assert_eq!(acc.data(), &0xDEADBEEFu64.to_le_bytes());
     }
 
     #[test]
