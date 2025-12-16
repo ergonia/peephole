@@ -126,6 +126,40 @@ pub enum NextAccount {
     Account(AccountInInstruction, AccountIterator),
 }
 
+/// Result of `AccountIterator::next_header()`.
+pub enum NextHeader {
+    /// All accounts consumed. Contains (instruction_data, program_id).
+    Data(&'static mut [u8], &'static Pubkey),
+    /// Real account header parsed, cursor ready for data operations.
+    Header(AccountHeaderCursor<'static>),
+    /// Duplicate marker—the `usize` is the index of the original account.
+    Dup(usize, AccountIterator),
+}
+
+/// Parsed account header with cursor positioned at account data.
+///
+/// This type separates header parsing from data parsing, allowing you to:
+/// - Inspect signer/metadata without assuming account type
+/// - Peek at data before committing to parse
+/// - Validate size before costly typed parsing
+///
+/// The cursor holds a reference to the 128-byte header and a pointer to the
+/// data region. Data slice creation is deferred until you call a parse method.
+///
+/// # Lifetime Safety
+///
+/// Peek methods return references with lifetime tied to `&self`. Since consuming
+/// methods (`parse_data`, `skip`) take `self` by value, the borrow checker prevents
+/// holding peek references while calling consuming methods—no aliasing possible.
+pub struct AccountHeaderCursor<'a> {
+    /// The 128-byte header with key, owner, lamports, etc.
+    pub static_data: &'a NonDupAccountStatic,
+    /// Pointer to account data (deferred slice creation).
+    data_ptr: *mut u8,
+    /// Accounts remaining after this one.
+    remaining_accounts_after: usize,
+}
+
 /// Iterates over accounts in the Solana runtime's serialized buffer.
 ///
 /// Walks the buffer, yielding each account (real or duplicate) until reaching
@@ -300,6 +334,52 @@ impl AccountIterator {
         (account, unsafe {
             AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
         })
+    }
+
+    /// Parses only the account header, returning a cursor for data operations.
+    ///
+    /// This separates header parsing from data parsing, enabling you to:
+    /// - Inspect signer/metadata without assuming account type
+    /// - Peek at data before committing to parse
+    /// - Validate size before costly typed parsing
+    ///
+    /// # Safety
+    ///
+    /// The next account must be real (marker byte `0xFF`). Panics in debug if it's a dup.
+    #[inline]
+    pub unsafe fn known_next_header(self) -> AccountHeaderCursor<'static> {
+        debug_assert!(self.remaining_accounts > 0);
+        debug_assert_eq!(*self.base_ptr, NON_DUP_MARKER);
+
+        let (static_data, data_ptr) = slurp::<NonDupAccountStatic>(self.base_ptr);
+
+        AccountHeaderCursor {
+            static_data,
+            data_ptr,
+            remaining_accounts_after: self.remaining_accounts - 1,
+        }
+    }
+
+    /// Advances to the next account header, or returns instruction data if done.
+    ///
+    /// Unlike `next()`, this returns the header separately from the data, allowing
+    /// you to inspect metadata before deciding how to parse the data.
+    #[inline(always)]
+    pub fn next_header(self) -> NextHeader {
+        if self.remaining_accounts == 0 {
+            let (slice, program_id) = self.slurp_instruction_data();
+            NextHeader::Data(slice, program_id)
+        } else {
+            let is_dup = unsafe { *self.base_ptr };
+            if is_dup == NON_DUP_MARKER {
+                NextHeader::Header(unsafe { self.known_next_header() })
+            } else {
+                let next = unsafe { self.base_ptr.add(8) };
+                NextHeader::Dup(is_dup as usize, unsafe {
+                    AccountIterator::new_from_raw(next, self.remaining_accounts - 1)
+                })
+            }
+        }
     }
 
     /// Like `known_next_full_account`, but also assumes the next account pointer is already
@@ -585,6 +665,257 @@ impl AccountIterator {
     }
 }
 
+// ============================================================================
+// AccountHeaderCursor implementation
+// ============================================================================
+
+impl<'a> AccountHeaderCursor<'a> {
+    // ------------------------------------------------------------------------
+    // Size inspection (safe, no pointer arithmetic)
+    // ------------------------------------------------------------------------
+
+    /// Returns the account data length.
+    #[inline]
+    pub fn data_len(&self) -> u64 {
+        self.static_data.data_len
+    }
+
+    /// Returns true if account data is at least `min_bytes` long.
+    #[inline]
+    pub fn has_min_size(&self, min_bytes: usize) -> bool {
+        self.static_data.data_len >= min_bytes as u64
+    }
+
+    /// Returns true if account data is exactly `exact_bytes` long.
+    #[inline]
+    pub fn has_exact_size(&self, exact_bytes: usize) -> bool {
+        self.static_data.data_len == exact_bytes as u64
+    }
+
+    /// Returns true if account data length matches `size_of::<T>()`.
+    #[inline]
+    pub fn has_size_of<T>(&self) -> bool {
+        self.static_data.data_len == core::mem::size_of::<T>() as u64
+    }
+
+    // ------------------------------------------------------------------------
+    // Peek methods
+    // ------------------------------------------------------------------------
+
+    /// Raw pointer to account data start.
+    ///
+    /// # Safety
+    ///
+    /// Bypasses lifetime tracking—caller must not hold this pointer when calling
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub unsafe fn peek_data_ptr(&self) -> *const u8 {
+        self.data_ptr
+    }
+
+    /// Mutable raw pointer to account data start.
+    ///
+    /// # Safety
+    ///
+    /// Bypasses lifetime tracking—caller must not hold this pointer when calling
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub unsafe fn peek_data_ptr_mut(&self) -> *mut u8 {
+        self.data_ptr
+    }
+
+    /// Peek at first `len` bytes of account data.
+    ///
+    /// Returns `None` if `data_len < len`.
+    ///
+    /// The returned slice borrows the cursor, preventing concurrent calls to
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub fn peek_bytes(&self, len: usize) -> Option<&[u8]> {
+        if self.static_data.data_len < len as u64 {
+            return None;
+        }
+        // SAFETY: data_ptr valid by construction, bounds checked above
+        Some(unsafe { core::slice::from_raw_parts(self.data_ptr, len) })
+    }
+
+    /// Peek at first `len` bytes of account data, mutable.
+    ///
+    /// Returns `None` if `data_len < len`.
+    ///
+    /// The returned slice borrows the cursor, preventing concurrent calls to
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub fn peek_bytes_mut(&mut self, len: usize) -> Option<&mut [u8]> {
+        if self.static_data.data_len < len as u64 {
+            return None;
+        }
+        // SAFETY: data_ptr valid by construction, bounds checked above
+        Some(unsafe { core::slice::from_raw_parts_mut(self.data_ptr, len) })
+    }
+
+    /// Peek at account data as type `T`.
+    ///
+    /// Returns `None` if `data_len != size_of::<T>()`.
+    ///
+    /// The returned reference borrows the cursor, preventing concurrent calls to
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub fn peek_as<T>(&self) -> Option<&T> {
+        if self.static_data.data_len != core::mem::size_of::<T>() as u64 {
+            return None;
+        }
+        // SAFETY: data_ptr valid by construction, size checked above
+        Some(unsafe { &*(self.data_ptr as *const T) })
+    }
+
+    /// Peek at account data as type `T`, mutable.
+    ///
+    /// Returns `None` if `data_len != size_of::<T>()`.
+    ///
+    /// The returned reference borrows the cursor, preventing concurrent calls to
+    /// consuming methods (`parse_data`, `skip`).
+    #[inline]
+    pub fn peek_as_mut<T>(&mut self) -> Option<&mut T> {
+        if self.static_data.data_len != core::mem::size_of::<T>() as u64 {
+            return None;
+        }
+        // SAFETY: data_ptr valid by construction, size checked above
+        Some(unsafe { &mut *(self.data_ptr as *mut T) })
+    }
+
+    // ------------------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------------------
+
+    /// Compute the pointer to the next account without creating a data slice.
+    #[inline]
+    unsafe fn compute_next_ptr<S: Slurper>(&self) -> *mut u8 {
+        let data_len = S::get_account_size(&self.static_data.data_len);
+        let next = self.data_ptr.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = S::get_next_pointer(next);
+        // Skip rent_epoch (8 bytes)
+        next.add(8)
+    }
+
+    // ------------------------------------------------------------------------
+    // Consume/parse methods
+    // ------------------------------------------------------------------------
+
+    /// Skip this account entirely, returning iterator at next account.
+    ///
+    /// # Safety
+    ///
+    /// The cursor must have been created from a valid account.
+    #[inline]
+    pub unsafe fn skip(self) -> AccountIterator {
+        let next = self.compute_next_ptr::<Dynamic>();
+        AccountIterator::new_from_raw(next, self.remaining_accounts_after)
+    }
+
+    /// Parse full account data as `NonDupAccount`.
+    ///
+    /// # Safety
+    ///
+    /// The cursor must have been created from a valid account.
+    #[inline]
+    pub unsafe fn parse_data(self) -> (NonDupAccount<'a>, AccountIterator) {
+        self.parse_data_impl::<Dynamic>()
+    }
+
+    /// Parse account, assuming next pointer is already 8-byte aligned.
+    ///
+    /// # Safety
+    ///
+    /// The cursor must have been created from a valid account, and the next
+    /// account pointer must be 8-byte aligned.
+    #[inline]
+    pub unsafe fn parse_data_aligned(self) -> (NonDupAccount<'a>, AccountIterator) {
+        self.parse_data_impl::<Aligned>()
+    }
+
+    /// Parse account using compile-time size of `T` for pointer arithmetic.
+    ///
+    /// # Safety
+    ///
+    /// The cursor must have been created from a valid account, and
+    /// `data_len` must equal `size_of::<T>()`.
+    #[inline]
+    pub unsafe fn parse_data_like_type<T>(self) -> (NonDupAccount<'a>, AccountIterator) {
+        self.parse_data_impl::<TypedSlurper<T>>()
+    }
+
+    #[inline]
+    unsafe fn parse_data_impl<S: Slurper>(self) -> (NonDupAccount<'a>, AccountIterator) {
+        let data_len = S::get_account_size(&self.static_data.data_len);
+        let data = core::slice::from_raw_parts_mut(self.data_ptr, data_len as usize);
+
+        let next = self.data_ptr.add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = S::get_next_pointer(next);
+        let (rent_epoch, next) = slurp::<u64>(next);
+
+        let account = NonDupAccount {
+            static_data: self.static_data,
+            all_data: data,
+            rent_epoch,
+        };
+
+        (account, AccountIterator::new_from_raw(next, self.remaining_accounts_after))
+    }
+
+    // ------------------------------------------------------------------------
+    // Checked typed parsing
+    // ------------------------------------------------------------------------
+
+    /// Parse as type `T`, verifying size matches first.
+    ///
+    /// Returns `Err(self)` if `data_len != size_of::<T>()`, allowing you to
+    /// try a different type or skip.
+    ///
+    /// # Safety
+    ///
+    /// The cursor must have been created from a valid account.
+    #[inline]
+    pub unsafe fn parse_typed_checked<T: Pod + Zeroable>(
+        self,
+    ) -> Result<(&'static mut TypedNonDupAccount<T>, AccountIterator), Self> {
+        if self.static_data.data_len != core::mem::size_of::<T>() as u64 {
+            return Err(self);
+        }
+        Ok(self.parse_typed_unchecked::<T>())
+    }
+
+    /// Parse as type `T`, assuming size matches.
+    ///
+    /// Debug builds assert `data_len == size_of::<T>()`.
+    ///
+    /// # Safety
+    ///
+    /// The cursor must have been created from a valid account, and
+    /// `data_len` must equal `size_of::<T>()`.
+    #[inline]
+    pub unsafe fn parse_typed_unchecked<T: Pod + Zeroable>(
+        self,
+    ) -> (&'static mut TypedNonDupAccount<T>, AccountIterator) {
+        debug_assert_eq!(
+            self.static_data.data_len,
+            core::mem::size_of::<T>() as u64,
+            "Type size mismatch: expected {}, got {}",
+            core::mem::size_of::<T>(),
+            self.static_data.data_len
+        );
+
+        // Reinterpret from original base (header start), not data_ptr
+        let header_ptr = (self.static_data as *const NonDupAccountStatic) as *mut u8;
+        let (typed_account, _) = slurp::<TypedNonDupAccount<T>>(header_ptr);
+
+        // Compute next pointer
+        let next = self.compute_next_ptr::<TypedSlurper<T>>();
+
+        (typed_account, AccountIterator::new_from_raw(next, self.remaining_accounts_after))
+    }
+}
+
 /// The 128-byte fixed header for a real account in the serialized buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, PartialEq, Eq, Debug)]
@@ -686,7 +1017,7 @@ pub mod arbitrary_impls {
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
 
-    use crate::solana_export::{self, pubkey_bytes, pubkey_from_array, unique_pubkey, IsAccount};
+    use crate::solana_export::{self, pubkey_bytes,  unique_pubkey, IsAccount};
 
     use crate::bytes::PodUtils;
 
@@ -709,6 +1040,8 @@ pub mod arbitrary_impls {
     #[cfg(test)]
     impl Arbitrary for TestAccount {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        use crate::solana_export::pubkey_from_array;
+
             let should_be_dup = u8::arbitrary(g) < 200;
             if should_be_dup {
                 let index = u8::arbitrary(g);
@@ -1724,6 +2057,7 @@ mod tests {
     use super::*;
 
     use super::arbitrary_impls::*;
+    use crate::bytes::PodUtils;
 
     fn test_account_parsing(accounts: Vec<TestAccount>, instruction_data: Vec<u8>) {
         let (mut instruction, _program_id) =
@@ -3320,6 +3654,255 @@ mod tests {
                     return true;
                 }
             }
+        }
+    }
+
+    // ============================================================================
+    // AccountHeaderCursor tests
+    // ============================================================================
+
+    #[quickcheck_macros::quickcheck]
+    fn quickcheck_next_header_matches_next(
+        account_types: Vec<TestAccountType>,
+        instruction_data_gen: Vec<u8>,
+    ) -> bool {
+        // Property: next_header() should produce equivalent results to next()
+        let test_accounts = create_test_accounts_from_types(&account_types);
+        if test_accounts.is_empty() {
+            return true; // Skip empty case
+        }
+
+        let (mut instruction, _) =
+            create_test_instruction(test_accounts, instruction_data_gen.clone());
+
+        let iter1 = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        // Clone the iterator to iterate the same buffer two ways
+        let iter2 = unsafe { iter1.unsafe_clone() };
+
+        let mut iter1 = iter1;
+        let mut iter2 = iter2;
+
+        loop {
+            match (iter1.next(), iter2.next_header()) {
+                (NextAccount::Data(data1, pid1), NextHeader::Data(data2, pid2)) => {
+                    return data1 == data2 && pid1 == pid2;
+                }
+                (
+                    NextAccount::Account(AccountInInstruction::Dup(idx1), next1),
+                    NextHeader::Dup(idx2, next2),
+                ) => {
+                    if idx1 != idx2 {
+                        return false;
+                    }
+                    iter1 = next1;
+                    iter2 = next2;
+                }
+                (
+                    NextAccount::Account(AccountInInstruction::RealAccount(acc1), next1),
+                    NextHeader::Header(cursor),
+                ) => {
+                    // Verify header matches (same underlying buffer, so pointers should match)
+                    if acc1.static_data.key != cursor.static_data.key {
+                        return false;
+                    }
+                    if acc1.static_data.is_signer != cursor.static_data.is_signer {
+                        return false;
+                    }
+                    if acc1.static_data.data_len != cursor.data_len() {
+                        return false;
+                    }
+
+                    // Skip data comparison since we're iterating same buffer with aliased refs
+                    // Just verify the cursor can parse and advance correctly
+                    let (_acc2, next2) = unsafe { cursor.parse_data() };
+
+                    iter1 = next1;
+                    iter2 = next2;
+                }
+                _ => return false, // Mismatched variants
+            }
+        }
+    }
+
+    #[test]
+    fn test_cursor_size_inspection() {
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let cursor = unsafe { iter.known_next_header() };
+
+        assert_eq!(cursor.data_len(), 8);
+        assert!(cursor.has_min_size(1));
+        assert!(cursor.has_min_size(8));
+        assert!(!cursor.has_min_size(9));
+        assert!(cursor.has_exact_size(8));
+        assert!(!cursor.has_exact_size(7));
+        assert!(cursor.has_size_of::<u64>());
+        assert!(!cursor.has_size_of::<u32>());
+    }
+
+    #[test]
+    fn test_cursor_peek_bytes() {
+        let (account, data) = create_test_account(true, true, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let cursor = unsafe { iter.known_next_header() };
+
+        // Peek at first 2 bytes
+        let peeked = cursor.peek_bytes(2).unwrap();
+        assert_eq!(peeked, &[0xAA, 0xBB]);
+
+        // Peek at all 4 bytes
+        let peeked = cursor.peek_bytes(4).unwrap();
+        assert_eq!(peeked, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // Peek beyond bounds returns None
+        assert!(cursor.peek_bytes(5).is_none());
+
+        // Can still parse after peeking
+        let (acc, _) = unsafe { cursor.parse_data() };
+        assert_eq!(acc.data(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn test_cursor_peek_as() {
+        let data_bytes: Vec<u8> = 0x12345678u64.to_le_bytes().to_vec();
+        let (account, data) = create_test_account(true, true, data_bytes);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let cursor = unsafe { iter.known_next_header() };
+
+        // peek_as with correct size
+        let peeked: &u64 = cursor.peek_as().unwrap();
+        assert_eq!(*peeked, 0x12345678u64);
+
+        // peek_as with wrong size returns None
+        let wrong: Option<&u32> = cursor.peek_as();
+        assert!(wrong.is_none());
+    }
+
+    #[test]
+    fn test_cursor_skip() {
+        let (acc1, data1) = create_test_account(true, false, vec![1, 2, 3, 4]);
+        let (acc2, data2) = create_test_account(false, true, vec![5, 6, 7, 8]);
+        let (mut instruction, _) = create_test_instruction(
+            vec![
+                TestAccount::Real(acc1, data1, 0),
+                TestAccount::Real(acc2, data2, 0),
+            ],
+            vec![99],
+        );
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // Skip first account via cursor
+        let cursor = unsafe { iter.known_next_header() };
+        assert!(cursor.static_data.is_signer());
+        let iter = unsafe { cursor.skip() };
+
+        // Second account should be accessible
+        let cursor = unsafe { iter.known_next_header() };
+        assert!(cursor.static_data.is_writable());
+        let (acc, iter) = unsafe { cursor.parse_data() };
+        assert_eq!(acc.data(), &[5, 6, 7, 8]);
+
+        // Should reach instruction data
+        match iter.next_header() {
+            NextHeader::Data(data, _) => assert_eq!(data, &[99]),
+            _ => panic!("Expected instruction data"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_parse_typed_checked() {
+        let data_bytes: Vec<u8> = QuickCheckAligned { a: 42, b: 99 }.to_vec();
+        let (account, data) = create_test_account(true, true, data_bytes);
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let cursor = unsafe { iter.known_next_header() };
+
+        // Correct type should succeed
+        match unsafe { cursor.parse_typed_checked::<QuickCheckAligned>() } {
+            Ok((typed, _)) => {
+                assert_eq!(typed.data.a, 42);
+                assert_eq!(typed.data.b, 99);
+            }
+            Err(_) => panic!("Expected successful parse"),
+        }
+    }
+
+    #[test]
+    fn test_cursor_parse_typed_checked_wrong_size() {
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]); // 4 bytes
+        let (mut instruction, _) =
+            create_test_instruction(vec![TestAccount::Real(account, data, 0)], vec![]);
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+        let cursor = unsafe { iter.known_next_header() };
+
+        // Wrong size should return Err with cursor
+        match unsafe { cursor.parse_typed_checked::<QuickCheckAligned>() } {
+            Ok(_) => panic!("Expected error for wrong size"),
+            Err(returned_cursor) => {
+                // Can still use the returned cursor
+                assert_eq!(returned_cursor.data_len(), 4);
+                let iter = unsafe { returned_cursor.skip() };
+                assert_eq!(iter.remaining_accounts(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_next_header_with_dups() {
+        let (account, data) = create_test_account(true, true, vec![1, 2, 3, 4]);
+        let (mut instruction, _) = create_test_instruction(
+            vec![
+                TestAccount::Real(account, data, 0),
+                TestAccount::Duplicate(0),
+                TestAccount::Duplicate(0),
+            ],
+            vec![],
+        );
+
+        let iter = unsafe { AccountIterator::new_from_instruction(instruction.as_mut_ptr()) };
+
+        // First: real account
+        match iter.next_header() {
+            NextHeader::Header(cursor) => {
+                assert!(cursor.static_data.is_signer());
+                let (_, iter) = unsafe { cursor.parse_data() };
+
+                // Second: dup
+                match iter.next_header() {
+                    NextHeader::Dup(idx, iter) => {
+                        assert_eq!(idx, 0);
+
+                        // Third: dup
+                        match iter.next_header() {
+                            NextHeader::Dup(idx, iter) => {
+                                assert_eq!(idx, 0);
+
+                                // Finally: data
+                                match iter.next_header() {
+                                    NextHeader::Data(_, _) => {}
+                                    _ => panic!("Expected data"),
+                                }
+                            }
+                            _ => panic!("Expected dup"),
+                        }
+                    }
+                    _ => panic!("Expected dup"),
+                }
+            }
+            _ => panic!("Expected header"),
         }
     }
 }
