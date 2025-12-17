@@ -15,20 +15,23 @@
 //! ## Iteration
 //!
 //! ```ignore
-//! use peephole::account_iterator::{AccountIterator, NextAccount, AccountInInstruction};
+//! use peephole::account_iterator::{AccountIterator, NextHeader};
 //!
 //! let mut iter = unsafe { AccountIterator::new_from_instruction(input) };
 //! loop {
-//!     match iter.next() {
-//!         NextAccount::Account(AccountInInstruction::RealAccount(acc), next) => {
-//!             let key = &acc.static_data.key;
-//!             let data = acc.data();
+//!     match iter.next_header() {
+//!         NextHeader::Header(cursor) => {
+//!             // Inspect header before parsing data
+//!             let key = &cursor.static_data.key;
+//!             let data_len = cursor.data_len();
+//!             let (acc, next) = unsafe { cursor.parse_data() };
 //!             iter = next;
 //!         }
-//!         NextAccount::Account(AccountInInstruction::Dup(idx), next) => {
+//!         NextHeader::Dup(idx, next) => {
+//!             // Duplicate of account `idx`
 //!             iter = next;
 //!         }
-//!         NextAccount::Data(instruction_data, program_id) => {
+//!         NextHeader::Data(instruction_data, program_id) => {
 //!             // instruction_data: &mut [u8], program_id: &Pubkey
 //!             break;
 //!         }
