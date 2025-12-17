@@ -718,7 +718,9 @@ impl<'a> AccountHeaderCursor<'a> {
     #[inline]
     unsafe fn compute_next_ptr<S: Slurper>(&self) -> *mut u8 {
         let data_len = S::get_account_size(&self.static_data.data_len);
-        let next = self.data_ptr().add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
+        let next = self
+            .data_ptr()
+            .add(data_len as usize + MAX_PERMITTED_DATA_INCREASE);
         let next = S::get_next_pointer(next);
         // Skip rent_epoch (8 bytes)
         next.add(8)
@@ -787,7 +789,10 @@ impl<'a> AccountHeaderCursor<'a> {
             rent_epoch,
         };
 
-        (account, AccountIterator::new_from_raw(next, self.remaining_accounts_after))
+        (
+            account,
+            AccountIterator::new_from_raw(next, self.remaining_accounts_after),
+        )
     }
 
     // ------------------------------------------------------------------------
@@ -839,7 +844,10 @@ impl<'a> AccountHeaderCursor<'a> {
         // Compute next pointer
         let next = self.compute_next_ptr::<TypedSlurper<T>>();
 
-        (typed_account, AccountIterator::new_from_raw(next, self.remaining_accounts_after))
+        (
+            typed_account,
+            AccountIterator::new_from_raw(next, self.remaining_accounts_after),
+        )
     }
 }
 
@@ -944,7 +952,7 @@ pub mod arbitrary_impls {
     #[cfg(all(test, fuzzing))]
     compile_error!("fuzzing and test cannot both be true");
 
-    use crate::solana_export::{self, pubkey_bytes,  unique_pubkey, IsAccount};
+    use crate::solana_export::{self, pubkey_bytes, unique_pubkey, IsAccount};
 
     use crate::bytes::PodUtils;
 
@@ -967,7 +975,7 @@ pub mod arbitrary_impls {
     #[cfg(test)]
     impl Arbitrary for TestAccount {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-        use crate::solana_export::pubkey_from_array;
+            use crate::solana_export::pubkey_from_array;
 
             let should_be_dup = u8::arbitrary(g) < 200;
             if should_be_dup {
@@ -2019,7 +2027,9 @@ mod tests {
                             assert_eq!(parsed.data(), expected_data);
                             assert_eq!(*parsed.rent_epoch, expected_rent_epoch);
                         }
-                        TestAccount::Duplicate(_) => panic!("Expected real account, got dup marker"),
+                        TestAccount::Duplicate(_) => {
+                            panic!("Expected real account, got dup marker")
+                        }
                     }
                     iterator = next_iter;
                 }
